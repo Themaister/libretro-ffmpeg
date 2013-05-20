@@ -3,8 +3,8 @@ TARGET := libretro-ffmpeg.so
 SOURCE := $(wildcard *.c)
 OBJECTS := $(SOURCE:.c=.o)
 
-LIBS := $(shell pkg-config libavcodec libavformat libavutil libswscale --libs) -fPIC -shared -Wl,--no-undefined
-CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libswscale --cflags)
+LIBS := $(shell pkg-config libavcodec libavformat libavutil libswscale libswresample --libs) -fPIC -shared -Wl,--no-undefined
+CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libswscale libswresample --cflags)
 CFLAGS += -O3 -g -Wall -std=gnu99 -pedantic -fPIC
 
 all: $(TARGET)

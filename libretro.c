@@ -9,6 +9,8 @@
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 #include <libavutil/time.h>
+#include <libavutil/opt.h>
+#include <libswresample/swresample.h>
 
 // NOTE: THIS IS A BIG BAD HACK.
 
@@ -19,6 +21,7 @@
 static AVFormatContext *fctx;
 static AVCodecContext *vctx;
 static AVCodecContext *actx;
+static SwrContext *swr;
 static AVFrame *aud_frame;
 static AVFrame *vid_frame;
 static struct SwsContext *sws_ctx;
@@ -185,7 +188,6 @@ static void decode_audio(AVPacket *pkt)
       }
    }
 
-   const int16_t *data = (const int16_t*)aud_frame->data[0];
    size_t required_frames = audio_buffer_frames + aud_frame->nb_samples;
    if (required_frames > audio_buffer_frames_cap)
    {
@@ -195,7 +197,11 @@ static void decode_audio(AVPacket *pkt)
       audio_buffer = av_realloc(audio_buffer, audio_buffer_frames_cap * sizeof(int16_t) * 2);
    }
 
-   memcpy(audio_buffer + audio_buffer_frames * 2, data, aud_frame->nb_samples * sizeof(int16_t) * 2);
+   swr_convert(swr, (uint8_t*[]) { (uint8_t*)audio_buffer + audio_buffer_frames * sizeof(int16_t) * 2 },
+         aud_frame->nb_samples,
+         (const uint8_t**)aud_frame->data,
+         aud_frame->nb_samples);
+
    audio_buffer_frames += aud_frame->nb_samples;
 }
 
@@ -406,20 +412,22 @@ static bool init_media_info(void)
    if (actx)
    {
       media.sample_rate = actx->sample_rate;
-
-      if (actx->channels != 2)
-         LOG_ERR_GOTO("Channel count other than two not supported.", error);
-
-      if (actx->sample_fmt != AV_SAMPLE_FMT_S16)
-         LOG_ERR_GOTO("Sampling format other than S16_LE not supported.", error);
-
       aud_frame = avcodec_alloc_frame();
+      swr = swr_alloc();
+      av_opt_set_int(swr, "in_channel_layout", actx->channel_layout, 0);
+      av_opt_set_int(swr, "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
+      av_opt_set_int(swr, "in_sample_rate", media.sample_rate, 0);
+      av_opt_set_int(swr, "out_sample_rate", media.sample_rate, 0);
+      av_opt_set_int(swr, "in_sample_fmt", actx->sample_fmt, 0);
+      av_opt_set_int(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
+      swr_init(swr);
    }
 
    if (vctx)
    {
       media.fps    = 1.0 / (vctx->ticks_per_frame * av_q2d(vctx->time_base));
-      media.interpolate_fps =  59.85;
+      fprintf(stderr, "FPS: %.3f\n", media.fps);
+      media.interpolate_fps =  60.0;
       media.width  = vctx->width;
       media.height = vctx->height;
       media.aspect = (float)vctx->width * av_q2d(vctx->sample_aspect_ratio) / vctx->height;
@@ -526,6 +534,9 @@ void retro_unload_game(void)
       sws_freeContext(sws_ctx);
       sws_ctx = NULL;
    }
+
+   if (swr)
+      swr_free(&swr);
 
    temporal_index = 0.0;
 }
