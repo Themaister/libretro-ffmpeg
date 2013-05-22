@@ -1,4 +1,6 @@
 #include "libretro.h"
+#include "thread.h"
+#include "fifo_buffer.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -21,33 +23,23 @@
 static AVFormatContext *fctx;
 static AVCodecContext *vctx;
 static AVCodecContext *actx;
-static SwrContext *swr;
-static AVFrame *aud_frame;
-static AVFrame *vid_frame;
-static struct SwsContext *sws_ctx;
 static int video_stream;
 static int audio_stream;
 
-static double temporal_ratio;
-static double temporal_index;
-static unsigned conv_frame_primary;
+static uint64_t frame_cnt;
+static uint64_t audio_frames;
 
-static unsigned conv_frame_decoded;
-static unsigned conv_frame_used;
+static volatile bool decode_thread_dead;
+static fifo_buffer_t *video_decode_fifo;
+static fifo_buffer_t *audio_decode_fifo;
+static scond_t *fifo_cond;
+static scond_t *fifo_decode_cond;
+static slock_t *fifo_lock;
+static sthread_t *decode_thread_handle;
 
-#define FRAME_BUFFER 8
-static AVFrame *conv_frame[FRAME_BUFFER];
-static void *conv_frame_buf[FRAME_BUFFER];
-#define PREV_FRAME(index) (((index) - 1) & (FRAME_BUFFER - 1))
-#define NEXT_FRAME(index) (((index) + 1) & (FRAME_BUFFER - 1))
+static uint32_t *video_read_buffer;
 
-static uint32_t *blended_buf;
-static unsigned frame_cnt;
-
-static int16_t *audio_buffer;
-static size_t audio_buffer_frames;
-static size_t audio_buffer_frames_cap;
-static size_t audio_write_cnt;
+static double packet_pts;
 
 static struct
 {
@@ -149,213 +141,74 @@ void retro_set_video_refresh(retro_video_refresh_t cb)
 void retro_reset(void)
 {}
 
-static void decode_video(AVPacket *pkt)
-{
-   unsigned retry_cnt = 0;
-   int got_ptr = 0;
-
-   while (!got_ptr)
-   {
-      if (avcodec_decode_video2(vctx, vid_frame, &got_ptr, pkt) <= 0)
-      {
-         if (retry_cnt++ < 4)
-            continue;
-
-         return;
-      }
-   }
-
-   conv_frame_decoded++;
-   unsigned conv_frame_decode_target = conv_frame_decoded & (FRAME_BUFFER - 1);
-
-   sws_scale(sws_ctx, (const uint8_t * const*)vid_frame->data, vid_frame->linesize, 0, media.height,
-         conv_frame[conv_frame_decode_target]->data, conv_frame[conv_frame_decode_target]->linesize);
-}
-
-static void decode_audio(AVPacket *pkt)
-{
-   unsigned retry_cnt = 0;
-   int got_ptr = 0;
-
-   while (!got_ptr)
-   {
-      if (avcodec_decode_audio4(actx, aud_frame, &got_ptr, pkt) < 0)
-      {
-         if (retry_cnt++ < 4)
-            continue;
-
-         return;
-      }
-   }
-
-   size_t required_frames = audio_buffer_frames + aud_frame->nb_samples;
-   if (required_frames > audio_buffer_frames_cap)
-   {
-      while (required_frames > audio_buffer_frames_cap)
-         audio_buffer_frames_cap = (audio_buffer_frames_cap + 1) * 2;
-
-      audio_buffer = av_realloc(audio_buffer, audio_buffer_frames_cap * sizeof(int16_t) * 2);
-   }
-
-   swr_convert(swr, (uint8_t*[]) { (uint8_t*)audio_buffer + audio_buffer_frames * sizeof(int16_t) * 2 },
-         aud_frame->nb_samples,
-         (const uint8_t**)aud_frame->data,
-         aud_frame->nb_samples);
-
-   audio_buffer_frames += aud_frame->nb_samples;
-}
-
-#if defined(__SSE2__) && 1
-#include <emmintrin.h>
-static void blend_temporal(uint32_t *buffer,
-      const AVFrame *primary, const AVFrame *secondary, double index,
-      unsigned width, unsigned height)
-{
-   const uint32_t *src_p = (const uint32_t*)primary->data[0];
-   const uint32_t *src_s = (const uint32_t*)secondary->data[0];
-   uint32_t *dst = buffer;
-
-   __m128i mul_factor_p = _mm_set1_epi16((int16_t)(index * 128.0));
-   __m128i mul_factor_s = _mm_set1_epi16((int16_t)((1.0 - index) * 128.0));
-   __m128i zero = _mm_setzero_si128();
-
-   for (unsigned y = 0; y < height; y++,
-         dst += width, src_p += (primary->linesize[0] >> 2), src_s += (secondary->linesize[0] >> 2))
-   {
-      for (unsigned x = 0; x < width; x += 4)
-      {
-         __m128i p_src = _mm_load_si128((const __m128i*)(src_p + x));
-         __m128i s_src = _mm_load_si128((const __m128i*)(src_s + x));
-         __m128i p_lo = _mm_unpacklo_epi8(p_src, zero);
-         __m128i p_hi = _mm_unpackhi_epi8(p_src, zero);
-         __m128i s_lo = _mm_unpacklo_epi8(s_src, zero);
-         __m128i s_hi = _mm_unpackhi_epi8(s_src, zero);
-
-         p_lo = _mm_mullo_epi16(p_lo, mul_factor_p);
-         p_hi = _mm_mullo_epi16(p_hi, mul_factor_p);
-         s_lo = _mm_mullo_epi16(s_lo, mul_factor_s);
-         s_hi = _mm_mullo_epi16(s_hi, mul_factor_s);
-
-         __m128i res_lo = _mm_srli_epi16(_mm_adds_epi16(p_lo, s_lo), 7);
-         __m128i res_hi = _mm_srli_epi16(_mm_adds_epi16(p_hi, s_hi), 7);
-         _mm_store_si128((__m128i*)(dst + x), _mm_packus_epi16(res_lo, res_hi));
-      }
-   }
-}
-#else
-static void blend_temporal(uint32_t *buffer,
-      const AVFrame *primary, const AVFrame *secondary, double index,
-      unsigned width, unsigned height)
-{
-   const uint32_t *src_p = (const uint32_t*)primary->data[0];
-   const uint32_t *src_s = (const uint32_t*)secondary->data[0];
-   uint32_t *dst = buffer;
-
-   uint32_t mul_factor_p = index * 256;
-   uint32_t mul_factor_s = 256 - mul_factor_p;
-
-   for (unsigned y = 0; y < height; y++,
-         dst += width, src_p += (primary->linesize[0] >> 2), src_s += (secondary->linesize[0] >> 2))
-   {
-      for (unsigned x = 0; x < width; x++)
-      {
-         uint32_t src_p_col = src_p[x];
-         uint32_t src_s_col = src_s[x];
-         uint32_t src_p_r = (src_p_col & 0xff0000) * mul_factor_p;
-         uint32_t src_p_g = (src_p_col & 0x00ff00) * mul_factor_p;
-         uint32_t src_p_b = (src_p_col & 0x0000ff) * mul_factor_p;
-         uint32_t src_s_r = (src_s_col & 0xff0000) * mul_factor_s;
-         uint32_t src_s_g = (src_s_col & 0x00ff00) * mul_factor_s;
-         uint32_t src_s_b = (src_s_col & 0x0000ff) * mul_factor_s;
-         uint32_t res_r = (src_p_r + src_s_r + 0x80) >> 8;
-         uint32_t res_g = (src_p_g + src_s_g + 0x80) >> 8;
-         uint32_t res_b = (src_p_b + src_s_b + 0x80) >> 8;
-         dst[x] = (res_r & 0xff0000) | (res_g & 0x00ff00) | (res_b & 0x0000ff);
-      }
-   }
-}
-#endif
-
 void retro_run(void)
 {
    input_poll_cb();
 
-   size_t expected_audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
-   size_t should_play_frames = expected_audio_frames - audio_write_cnt;
-
-   // Check if we have already decoded images.
-   if (vctx)
+   if (decode_thread_dead)
    {
-      while (temporal_index >= 1.0 && conv_frame_used < conv_frame_decoded)
-      {
-         conv_frame_primary = NEXT_FRAME(conv_frame_primary);
-         temporal_index -= 1.0;
-         conv_frame_used++;
-      }
+      environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+      return;
    }
 
-   // We need a fresh frame before continuing.
-   while (temporal_index >= 1.0 || (actx && audio_buffer_frames < should_play_frames))
+   frame_cnt++;
+
+   bool dupe = true;
+   if (video_stream >= 0)
    {
-      AVPacket pkt;
-      if (av_read_frame(fctx, &pkt) < 0)
+      // Video
+      double min_pts = frame_cnt / media.interpolate_fps;
+      while (!decode_thread_dead && min_pts > packet_pts)
       {
-         // Movie is probably done playing.
-         environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
-         return;
-      }
+         slock_lock(fifo_lock);
+         size_t to_read_frame_bytes = media.width * media.height * sizeof(uint32_t) + sizeof(int64_t);
+         while (!decode_thread_dead && fifo_read_avail(video_decode_fifo) < to_read_frame_bytes)
+            scond_wait(fifo_cond, fifo_lock);
 
-      if (pkt.stream_index == video_stream)
-      {
-         decode_video(&pkt);
-         av_free_packet(&pkt);
-
-         if (temporal_index >= 1.0)
+         int64_t pts = 0;
+         if (!decode_thread_dead)
          {
-            temporal_index -= 1.0;
-            conv_frame_primary = NEXT_FRAME(conv_frame_primary);
-            conv_frame_used++;
+            fifo_read(video_decode_fifo, &pts, sizeof(int64_t));
+            fifo_read(video_decode_fifo, video_read_buffer, media.width * media.height * sizeof(uint32_t));
+            dupe = false;
          }
+
+         scond_signal(fifo_decode_cond);
+         slock_unlock(fifo_lock);
+
+         if (pts != AV_NOPTS_VALUE)
+            packet_pts = av_q2d(fctx->streams[video_stream]->time_base) * pts;
+         else
+            packet_pts += 1.0 / media.fps;
+
+         //fprintf(stderr, "PTS: %.2f s\n", packet_pts);
       }
-      else if (pkt.stream_index == audio_stream)
-      {
-         decode_audio(&pkt);
-         av_free_packet(&pkt);
-      }
-      else
-         av_free_packet(&pkt);
+
    }
 
-   if (vctx)
+   video_cb(dupe ? NULL : video_read_buffer, media.width, media.height, media.width * sizeof(uint32_t));
+
+   if (audio_stream >= 0)
    {
-      blend_temporal(blended_buf,
-            conv_frame[conv_frame_primary], conv_frame[PREV_FRAME(conv_frame_primary)],
-            temporal_index, media.width, media.height);
+      // Audio
+      uint64_t expected_audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
+      size_t to_read_frames = expected_audio_frames - audio_frames;
+      size_t to_read_bytes = to_read_frames * sizeof(int16_t) * 2;
 
-      temporal_index += temporal_ratio;
-      video_cb(blended_buf, media.width, media.height, media.width * sizeof(uint32_t));
-      frame_cnt++;
-   }
+      slock_lock(fifo_lock);
+      while (!decode_thread_dead && fifo_read_avail(audio_decode_fifo) < to_read_bytes)
+         scond_wait(fifo_cond, fifo_lock);
 
-   if (actx)
-   {
-      if (should_play_frames > audio_buffer_frames)
-      {
-         fprintf(stderr, "[FFmpeg]: Audio underrun! Expected to play %zu frames, can only play %zu frames.\n",
-               should_play_frames, audio_buffer_frames);
-         should_play_frames = audio_buffer_frames;
-      }
+      int16_t audio_buffer[2048];
+      if (!decode_thread_dead)
+         fifo_read(audio_decode_fifo, audio_buffer, to_read_bytes);
+      scond_signal(fifo_decode_cond);
+      slock_unlock(fifo_lock);
 
-      size_t written_frames = 0;
-      while (written_frames < should_play_frames)
-         written_frames += audio_batch_cb(audio_buffer + written_frames * 2,
-               should_play_frames - written_frames);
+      if (!decode_thread_dead)
+         audio_batch_cb(audio_buffer, to_read_frames);
 
-      // Ye, we should use ring buffers, but whatever ;)
-      memmove(audio_buffer, audio_buffer + should_play_frames * 2,
-            (audio_buffer_frames - should_play_frames) * sizeof(int16_t) * 2);
-      audio_buffer_frames -= should_play_frames;
-      audio_write_cnt += should_play_frames;
+      audio_frames += to_read_frames;
    }
 }
 
@@ -410,56 +263,166 @@ static bool open_codecs(void)
 static bool init_media_info(void)
 {
    if (actx)
-   {
       media.sample_rate = actx->sample_rate;
-      aud_frame = avcodec_alloc_frame();
-      swr = swr_alloc();
-      av_opt_set_int(swr, "in_channel_layout", actx->channel_layout, 0);
-      av_opt_set_int(swr, "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
-      av_opt_set_int(swr, "in_sample_rate", media.sample_rate, 0);
-      av_opt_set_int(swr, "out_sample_rate", media.sample_rate, 0);
-      av_opt_set_int(swr, "in_sample_fmt", actx->sample_fmt, 0);
-      av_opt_set_int(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
-      swr_init(swr);
-   }
 
    if (vctx)
    {
-      media.fps    = 1.0 / (vctx->ticks_per_frame * av_q2d(vctx->time_base));
+      media.fps = 1.0 / (vctx->ticks_per_frame * av_q2d(vctx->time_base));
       fprintf(stderr, "FPS: %.3f\n", media.fps);
-      media.interpolate_fps =  60.0;
+      media.interpolate_fps = 60.0;
       media.width  = vctx->width;
       media.height = vctx->height;
       media.aspect = (float)vctx->width * av_q2d(vctx->sample_aspect_ratio) / vctx->height;
+   }
 
-      vid_frame = avcodec_alloc_frame();
+   return true;
+}
 
-      sws_ctx = sws_getCachedContext(sws_ctx,
+static void decode_video(AVPacket *pkt, AVFrame *frame, AVFrame *conv, struct SwsContext *sws)
+{
+   unsigned retry_cnt = 0;
+   int got_ptr = 0;
+
+   while (!got_ptr)
+   {
+      if (avcodec_decode_video2(vctx, frame, &got_ptr, pkt) <= 0)
+      {
+         if (retry_cnt++ < 4)
+            continue;
+
+         return;
+      }
+   }
+
+   sws_scale(sws, (const uint8_t * const*)frame->data, frame->linesize, 0, media.height,
+         conv->data, conv->linesize);
+}
+
+static int16_t *decode_audio(AVPacket *pkt, AVFrame *frame, int16_t *buffer, size_t *buffer_cap,
+      size_t *written_bytes,
+      SwrContext *swr)
+{
+   unsigned retry_cnt = 0;
+   int got_ptr = 0;
+
+   while (!got_ptr)
+   {
+      if (avcodec_decode_audio4(actx, frame, &got_ptr, pkt) < 0)
+      {
+         if (retry_cnt++ < 4)
+            continue;
+
+         return buffer;
+      }
+   }
+
+   size_t required_buffer = frame->nb_samples * sizeof(int16_t) * 2;
+   if (required_buffer > *buffer_cap)
+   {
+      buffer = av_realloc(buffer, required_buffer);
+      *buffer_cap = required_buffer;
+   }
+
+   swr_convert(swr,
+         (uint8_t*[]) { (uint8_t*)buffer },
+         frame->nb_samples,
+         (const uint8_t**)frame->data,
+         frame->nb_samples);
+
+   *written_bytes = required_buffer;
+
+   return buffer;
+}
+
+static void decode_thread(void *data)
+{
+   (void)data;
+   struct SwsContext *sws = sws_getCachedContext(NULL,
             media.width, media.height, vctx->pix_fmt,
             media.width, media.height, PIX_FMT_RGB32,
             SWS_POINT, NULL, NULL, NULL);
 
-      size_t size = avpicture_get_size(PIX_FMT_RGB32, media.width, media.height);
+   SwrContext *swr = swr_alloc();
+   av_opt_set_int(swr, "in_channel_layout", actx->channel_layout, 0);
+   av_opt_set_int(swr, "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
+   av_opt_set_int(swr, "in_sample_rate", media.sample_rate, 0);
+   av_opt_set_int(swr, "out_sample_rate", media.sample_rate, 0);
+   av_opt_set_int(swr, "in_sample_fmt", actx->sample_fmt, 0);
+   av_opt_set_int(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
+   swr_init(swr);
 
-      for (unsigned i = 0; i < FRAME_BUFFER; i++)
+   AVFrame *aud_frame = avcodec_alloc_frame();
+   AVFrame *vid_frame = avcodec_alloc_frame();
+
+   size_t frame_size = avpicture_get_size(PIX_FMT_RGB32, media.width, media.height);
+   AVFrame *conv_frame = avcodec_alloc_frame();
+   void *conv_frame_buf = av_malloc(frame_size);
+   avpicture_fill((AVPicture*)conv_frame, conv_frame_buf,
+         PIX_FMT_RGB32, media.width, media.height);
+
+   int16_t *audio_buffer = NULL;
+   size_t audio_buffer_cap = 0;
+
+   while (!decode_thread_dead)
+   {
+      AVPacket pkt;
+      if (av_read_frame(fctx, &pkt) < 0)
+         break;
+
+      if (pkt.stream_index == video_stream)
       {
-         conv_frame_buf[i] = av_malloc(size);
-         if (!conv_frame_buf[i])
-            LOG_ERR_GOTO("Failed to allocate frame.", error);
+         decode_video(&pkt, vid_frame, conv_frame, sws);
+         int64_t pts = vid_frame->pts;
 
-         conv_frame[i] = avcodec_alloc_frame();
-         avpicture_fill((AVPicture*)conv_frame[i], conv_frame_buf[i],
-               PIX_FMT_RGB32, media.width, media.height);
+         size_t decoded_size = frame_size + sizeof(pts);
+         slock_lock(fifo_lock);
+         while (!decode_thread_dead && fifo_write_avail(video_decode_fifo) < decoded_size)
+            scond_wait(fifo_decode_cond, fifo_lock);
+
+         if (!decode_thread_dead)
+         {
+            fifo_write(video_decode_fifo, &pts, sizeof(pts));
+            const uint8_t *src = conv_frame->data[0];
+            int stride = conv_frame->linesize[0];
+            for (unsigned y = 0; y < media.height; y++, src += stride)
+               fifo_write(video_decode_fifo, src, media.width * sizeof(uint32_t));
+         }
+         scond_signal(fifo_cond);
+         slock_unlock(fifo_lock);
+      }
+      else if (pkt.stream_index == audio_stream)
+      {
+         size_t decoded_size = 0;
+         audio_buffer = decode_audio(&pkt, aud_frame,
+               audio_buffer, &audio_buffer_cap,
+               &decoded_size,
+               swr);
+
+         slock_lock(fifo_lock);
+         while (!decode_thread_dead && fifo_write_avail(audio_decode_fifo) < decoded_size)
+            scond_wait(fifo_decode_cond, fifo_lock);
+
+         if (!decode_thread_dead)
+            fifo_write(audio_decode_fifo, audio_buffer, decoded_size);
+         scond_signal(fifo_cond);
+         slock_unlock(fifo_lock);
       }
 
-      blended_buf = av_malloc(media.width * media.height * sizeof(uint32_t));
-      temporal_ratio = media.fps / media.interpolate_fps;
+      av_free_packet(&pkt);
    }
 
-   return true;
+   sws_freeContext(sws);
+   swr_free(&swr);
+   av_freep(&aud_frame);
+   av_freep(&vid_frame);
+   av_freep(&conv_frame);
+   av_freep(&conv_frame_buf);
+   av_freep(&audio_buffer);
 
-error:
-   return false;
+   slock_lock(fifo_lock);
+   decode_thread_dead = true;
+   scond_signal(fifo_cond);
+   slock_unlock(fifo_lock);
 }
 
 bool retro_load_game(const struct retro_game_info *info)
@@ -480,6 +443,17 @@ bool retro_load_game(const struct retro_game_info *info)
    if (!init_media_info())
       LOG_ERR_GOTO("Failed to init media info.", error);
 
+   decode_thread_dead = false;
+   video_decode_fifo = fifo_new(media.width * media.height * sizeof(uint32_t) * 32);
+   audio_decode_fifo = fifo_new(media.sample_rate * 2 * sizeof(int16_t) * 2);
+   fifo_cond = scond_new();
+   fifo_decode_cond = scond_new();
+   fifo_lock = slock_new();
+
+   video_read_buffer = av_malloc(media.width * media.height * sizeof(uint32_t));
+
+   decode_thread_handle = sthread_create(decode_thread, NULL);
+
    return true;
 
 error:
@@ -489,6 +463,31 @@ error:
 
 void retro_unload_game(void)
 {
+   slock_lock(fifo_lock);
+   decode_thread_dead = true;
+   scond_signal(fifo_decode_cond);
+   slock_unlock(fifo_lock);
+   sthread_join(decode_thread_handle);
+   decode_thread_handle = NULL;
+
+   scond_free(fifo_cond);
+   scond_free(fifo_decode_cond);
+   slock_free(fifo_lock);
+   fifo_free(video_decode_fifo);
+   fifo_free(audio_decode_fifo);
+
+   fifo_cond = NULL;
+   fifo_decode_cond = NULL;
+   fifo_lock = NULL;
+   video_decode_fifo = NULL;
+   audio_decode_fifo = NULL;
+
+   packet_pts = 0.0;
+   frame_cnt = 0;
+   audio_frames = 0;
+
+   av_freep(&video_read_buffer);
+
    if (actx)
    {
       avcodec_close(actx);
@@ -501,44 +500,11 @@ void retro_unload_game(void)
       vctx = NULL;
    }
 
-   if (aud_frame)
-      av_freep(&aud_frame);
-   if (vid_frame)
-      av_freep(&vid_frame);
-
    if (fctx)
    {
       avformat_close_input(&fctx);
       fctx = NULL;
    }
-
-   for (unsigned i = 0; i < FRAME_BUFFER; i++)
-   {
-      if (conv_frame[i])
-         av_freep(&conv_frame[i]);
-      if (conv_frame_buf[i])
-         av_freep(&conv_frame_buf[i]);
-   }
-
-   if (blended_buf)
-      av_freep(&blended_buf);
-
-   if (audio_buffer)
-      av_freep(&audio_buffer);
-   audio_buffer_frames = 0;
-   audio_buffer_frames_cap = 0;
-   audio_write_cnt = 0;
-
-   if (sws_ctx)
-   {
-      sws_freeContext(sws_ctx);
-      sws_ctx = NULL;
-   }
-
-   if (swr)
-      swr_free(&swr);
-
-   temporal_index = 0.0;
 }
 
 unsigned retro_get_region(void)
