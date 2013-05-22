@@ -40,6 +40,8 @@ static sthread_t *decode_thread_handle;
 static uint32_t *video_read_buffer;
 
 static double packet_pts;
+static double pts_bias;
+static double last_audio_pts;
 
 static struct
 {
@@ -153,12 +155,12 @@ void retro_run(void)
 
    frame_cnt++;
 
-   bool dupe = true;
+   double min_pts = frame_cnt / media.interpolate_fps + pts_bias;
    if (video_stream >= 0)
    {
       // Video
-      double min_pts = frame_cnt / media.interpolate_fps;
-      while (!decode_thread_dead && min_pts > packet_pts)
+      bool dupe = true;
+      while (!decode_thread_dead && min_pts >= packet_pts)
       {
          slock_lock(fifo_lock);
          size_t to_read_frame_bytes = media.width * media.height * sizeof(uint32_t) + sizeof(int64_t);
@@ -184,9 +186,13 @@ void retro_run(void)
          //fprintf(stderr, "PTS: %.2f s\n", packet_pts);
       }
 
+      video_cb(dupe ? NULL : video_read_buffer, media.width, media.height, media.width * sizeof(uint32_t));
    }
-
-   video_cb(dupe ? NULL : video_read_buffer, media.width, media.height, media.width * sizeof(uint32_t));
+   else
+   {
+      uint32_t black = 0;
+      video_cb(&black, 1, 1, sizeof(black));
+   }
 
    if (audio_stream >= 0)
    {
@@ -203,12 +209,15 @@ void retro_run(void)
       if (!decode_thread_dead)
          fifo_read(audio_decode_fifo, audio_buffer, to_read_bytes);
       scond_signal(fifo_decode_cond);
+
       slock_unlock(fifo_lock);
 
       if (!decode_thread_dead)
          audio_batch_cb(audio_buffer, to_read_frames);
 
       audio_frames += to_read_frames;
+
+      pts_bias = +0.25; // Hack
    }
 }
 
@@ -265,11 +274,11 @@ static bool init_media_info(void)
    if (actx)
       media.sample_rate = actx->sample_rate;
 
+   media.interpolate_fps = 60.0;
    if (vctx)
    {
       media.fps = 1.0 / (vctx->ticks_per_frame * av_q2d(vctx->time_base));
       fprintf(stderr, "FPS: %.3f\n", media.fps);
-      media.interpolate_fps = 60.0;
       media.width  = vctx->width;
       media.height = vctx->height;
       media.aspect = (float)vctx->width * av_q2d(vctx->sample_aspect_ratio) / vctx->height;
@@ -278,7 +287,7 @@ static bool init_media_info(void)
    return true;
 }
 
-static void decode_video(AVPacket *pkt, AVFrame *frame, AVFrame *conv, struct SwsContext *sws)
+static bool decode_video(AVPacket *pkt, AVFrame *frame, AVFrame *conv, struct SwsContext *sws)
 {
    unsigned retry_cnt = 0;
    int got_ptr = 0;
@@ -290,12 +299,13 @@ static void decode_video(AVPacket *pkt, AVFrame *frame, AVFrame *conv, struct Sw
          if (retry_cnt++ < 4)
             continue;
 
-         return;
+         return false;
       }
    }
 
    sws_scale(sws, (const uint8_t * const*)frame->data, frame->linesize, 0, media.height,
          conv->data, conv->linesize);
+   return true;
 }
 
 static int16_t *decode_audio(AVPacket *pkt, AVFrame *frame, int16_t *buffer, size_t *buffer_cap,
@@ -337,28 +347,44 @@ static int16_t *decode_audio(AVPacket *pkt, AVFrame *frame, int16_t *buffer, siz
 static void decode_thread(void *data)
 {
    (void)data;
-   struct SwsContext *sws = sws_getCachedContext(NULL,
+   struct SwsContext *sws = NULL;
+   
+   if (video_stream >= 0)
+   {
+      sws = sws_getCachedContext(NULL,
             media.width, media.height, vctx->pix_fmt,
             media.width, media.height, PIX_FMT_RGB32,
             SWS_POINT, NULL, NULL, NULL);
+   }
 
    SwrContext *swr = swr_alloc();
-   av_opt_set_int(swr, "in_channel_layout", actx->channel_layout, 0);
-   av_opt_set_int(swr, "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
-   av_opt_set_int(swr, "in_sample_rate", media.sample_rate, 0);
-   av_opt_set_int(swr, "out_sample_rate", media.sample_rate, 0);
-   av_opt_set_int(swr, "in_sample_fmt", actx->sample_fmt, 0);
-   av_opt_set_int(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
-   swr_init(swr);
+
+   if (audio_stream >= 0)
+   {
+      av_opt_set_int(swr, "in_channel_layout", actx->channel_layout, 0);
+      av_opt_set_int(swr, "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
+      av_opt_set_int(swr, "in_sample_rate", media.sample_rate, 0);
+      av_opt_set_int(swr, "out_sample_rate", media.sample_rate, 0);
+      av_opt_set_int(swr, "in_sample_fmt", actx->sample_fmt, 0);
+      av_opt_set_int(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
+      swr_init(swr);
+   }
 
    AVFrame *aud_frame = avcodec_alloc_frame();
    AVFrame *vid_frame = avcodec_alloc_frame();
 
-   size_t frame_size = avpicture_get_size(PIX_FMT_RGB32, media.width, media.height);
-   AVFrame *conv_frame = avcodec_alloc_frame();
-   void *conv_frame_buf = av_malloc(frame_size);
-   avpicture_fill((AVPicture*)conv_frame, conv_frame_buf,
-         PIX_FMT_RGB32, media.width, media.height);
+   AVFrame *conv_frame = NULL;
+   void *conv_frame_buf = NULL;
+   size_t frame_size = 0;
+
+   if (video_stream >= 0)
+   {
+      frame_size = avpicture_get_size(PIX_FMT_RGB32, media.width, media.height);
+      conv_frame = avcodec_alloc_frame();
+      conv_frame_buf = av_malloc(frame_size);
+      avpicture_fill((AVPicture*)conv_frame, conv_frame_buf,
+            PIX_FMT_RGB32, media.width, media.height);
+   }
 
    int16_t *audio_buffer = NULL;
    size_t audio_buffer_cap = 0;
@@ -371,24 +397,26 @@ static void decode_thread(void *data)
 
       if (pkt.stream_index == video_stream)
       {
-         decode_video(&pkt, vid_frame, conv_frame, sws);
-         int64_t pts = vid_frame->pts;
-
-         size_t decoded_size = frame_size + sizeof(pts);
-         slock_lock(fifo_lock);
-         while (!decode_thread_dead && fifo_write_avail(video_decode_fifo) < decoded_size)
-            scond_wait(fifo_decode_cond, fifo_lock);
-
-         if (!decode_thread_dead)
+         if (decode_video(&pkt, vid_frame, conv_frame, sws))
          {
-            fifo_write(video_decode_fifo, &pts, sizeof(pts));
-            const uint8_t *src = conv_frame->data[0];
-            int stride = conv_frame->linesize[0];
-            for (unsigned y = 0; y < media.height; y++, src += stride)
-               fifo_write(video_decode_fifo, src, media.width * sizeof(uint32_t));
+            int64_t pts = vid_frame->pts;
+
+            size_t decoded_size = frame_size + sizeof(pts);
+            slock_lock(fifo_lock);
+            while (!decode_thread_dead && fifo_write_avail(video_decode_fifo) < decoded_size)
+               scond_wait(fifo_decode_cond, fifo_lock);
+
+            if (!decode_thread_dead)
+            {
+               fifo_write(video_decode_fifo, &pts, sizeof(pts));
+               const uint8_t *src = conv_frame->data[0];
+               int stride = conv_frame->linesize[0];
+               for (unsigned y = 0; y < media.height; y++, src += stride)
+                  fifo_write(video_decode_fifo, src, media.width * sizeof(uint32_t));
+            }
+            scond_signal(fifo_cond);
+            slock_unlock(fifo_lock);
          }
-         scond_signal(fifo_cond);
-         slock_unlock(fifo_lock);
       }
       else if (pkt.stream_index == audio_stream)
       {
@@ -404,6 +432,8 @@ static void decode_thread(void *data)
 
          if (!decode_thread_dead)
             fifo_write(audio_decode_fifo, audio_buffer, decoded_size);
+
+         last_audio_pts = aud_frame->pts;
          scond_signal(fifo_cond);
          slock_unlock(fifo_lock);
       }
@@ -411,7 +441,8 @@ static void decode_thread(void *data)
       av_free_packet(&pkt);
    }
 
-   sws_freeContext(sws);
+   if (sws)
+      sws_freeContext(sws);
    swr_free(&swr);
    av_freep(&aud_frame);
    av_freep(&vid_frame);
@@ -444,8 +475,12 @@ bool retro_load_game(const struct retro_game_info *info)
       LOG_ERR_GOTO("Failed to init media info.", error);
 
    decode_thread_dead = false;
-   video_decode_fifo = fifo_new(media.width * media.height * sizeof(uint32_t) * 32);
-   audio_decode_fifo = fifo_new(media.sample_rate * 2 * sizeof(int16_t) * 2);
+
+   if (video_stream >= 0)
+      video_decode_fifo = fifo_new(media.width * media.height * sizeof(uint32_t) * 32);
+   if (audio_stream >= 0)
+      audio_decode_fifo = fifo_new(media.sample_rate * 2 * sizeof(int16_t) * 2);
+
    fifo_cond = scond_new();
    fifo_decode_cond = scond_new();
    fifo_lock = slock_new();
@@ -473,8 +508,11 @@ void retro_unload_game(void)
    scond_free(fifo_cond);
    scond_free(fifo_decode_cond);
    slock_free(fifo_lock);
-   fifo_free(video_decode_fifo);
-   fifo_free(audio_decode_fifo);
+
+   if (video_decode_fifo)
+      fifo_free(video_decode_fifo);
+   if (audio_decode_fifo)
+      fifo_free(audio_decode_fifo);
 
    fifo_cond = NULL;
    fifo_decode_cond = NULL;
@@ -483,6 +521,8 @@ void retro_unload_game(void)
    audio_decode_fifo = NULL;
 
    packet_pts = 0.0;
+   pts_bias = 0.0;
+   last_audio_pts = 0.0;
    frame_cnt = 0;
    audio_frames = 0;
 
