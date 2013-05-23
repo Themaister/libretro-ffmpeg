@@ -14,7 +14,7 @@
 #include <libavutil/opt.h>
 #include <libswresample/swresample.h>
 
-// NOTE: THIS IS A BIG BAD HACK.
+#include <GL/glew.h>
 
 #define LOG_ERR_GOTO(msg, label) do { \
    fprintf(stderr, "[FFmpeg]: " msg "\n"); goto label; \
@@ -39,9 +39,27 @@ static sthread_t *decode_thread_handle;
 
 static uint32_t *video_read_buffer;
 
-static double packet_pts;
 static double pts_bias;
 static double last_audio_pts;
+
+// GL stuff
+static struct retro_hw_render_callback hw_render;
+struct frame
+{
+   GLuint tex;
+   GLuint pbo;
+   double pts;
+};
+
+static struct frame frames[2];
+
+static GLuint prog;
+static GLuint vbo;
+static GLint vertex_loc;
+static GLint tex_loc;
+static GLint mix_loc;
+
+////
 
 static struct
 {
@@ -159,8 +177,14 @@ void retro_run(void)
    if (video_stream >= 0)
    {
       // Video
-      bool dupe = true;
-      while (!decode_thread_dead && min_pts >= packet_pts)
+      if (min_pts > frames[1].pts)
+      {
+         struct frame tmp = frames[1];
+         frames[1] = frames[0];
+         frames[0] = tmp;
+      }
+
+      while (!decode_thread_dead && min_pts > frames[1].pts)
       {
          slock_lock(fifo_lock);
          size_t to_read_frame_bytes = media.width * media.height * sizeof(uint32_t) + sizeof(int64_t);
@@ -171,28 +195,75 @@ void retro_run(void)
          if (!decode_thread_dead)
          {
             fifo_read(video_decode_fifo, &pts, sizeof(int64_t));
-            fifo_read(video_decode_fifo, video_read_buffer, media.width * media.height * sizeof(uint32_t));
-            dupe = false;
+
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, frames[1].pbo);
+            uint32_t *data = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER,
+                  0, media.width * media.height, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+
+            fifo_read(video_decode_fifo, data, media.width * media.height * sizeof(uint32_t));
+
+            glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+            glBindTexture(GL_TEXTURE_2D, frames[1].tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                  media.width, media.height, 0, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
          }
 
          scond_signal(fifo_decode_cond);
          slock_unlock(fifo_lock);
 
          if (pts != AV_NOPTS_VALUE)
-            packet_pts = av_q2d(fctx->streams[video_stream]->time_base) * pts;
+            frames[1].pts = av_q2d(fctx->streams[video_stream]->time_base) * pts;
+         else if (frames[1].pts < frames[0].pts)
+            frames[1].pts = frames[0].pts + 1.0 / media.fps;
          else
-            packet_pts += 1.0 / media.fps;
+            frames[1].pts += 1.0 / media.fps;
 
-         //fprintf(stderr, "PTS: %.2f s\n", packet_pts);
+         //fprintf(stderr, "OLD: %.2f s\n", frames[0].pts);
+         //fprintf(stderr, "PTS: %.2f s\n", frames[1].pts);
       }
 
-      video_cb(dupe ? NULL : video_read_buffer, media.width, media.height, media.width * sizeof(uint32_t));
+      float mix_factor = (min_pts - frames[0].pts) / (frames[1].pts - frames[0].pts);
+
+      //fprintf(stderr, "Mix factor: %f, diff: %f\n", mix_factor, frames[1].pts - frames[0].pts);
+
+      glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
+      glClearColor(0, 0, 0, 1);
+      glClear(GL_COLOR_BUFFER_BIT);
+      glViewport(0, 0, media.width, media.height);
+      glUseProgram(prog);
+
+      glUniform1f(mix_loc, mix_factor);
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, frames[1].tex);
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, frames[0].tex);
+
+
+      glBindBuffer(GL_ARRAY_BUFFER, vbo);
+      glVertexAttribPointer(vertex_loc, 2, GL_FLOAT, GL_FALSE,
+            4 * sizeof(GLfloat), (const GLvoid*)(0 * sizeof(GLfloat)));
+      glVertexAttribPointer(tex_loc, 2, GL_FLOAT, GL_FALSE,
+            4 * sizeof(GLfloat), (const GLvoid*)(2 * sizeof(GLfloat)));
+      glEnableVertexAttribArray(vertex_loc);
+      glEnableVertexAttribArray(tex_loc);
+      glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+      glDisableVertexAttribArray(vertex_loc);
+      glDisableVertexAttribArray(tex_loc);
+
+      glUseProgram(0);
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, 0);
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, 0);
+
+      video_cb(RETRO_HW_FRAME_BUFFER_VALID, media.width, media.height, media.width * sizeof(uint32_t));
    }
    else
-   {
-      uint32_t black = 0;
-      video_cb(&black, 1, 1, sizeof(black));
-   }
+      video_cb(NULL, 1, 1, sizeof(uint32_t));
 
    if (audio_stream >= 0)
    {
@@ -456,6 +527,75 @@ static void decode_thread(void *data)
    slock_unlock(fifo_lock);
 }
 
+static void context_reset(void)
+{
+   glewInit();
+   prog = glCreateProgram();
+   GLuint vert = glCreateShader(GL_VERTEX_SHADER);
+   GLuint frag = glCreateShader(GL_FRAGMENT_SHADER);
+
+   static const char *vertex_source =
+      "attribute vec2 aVertex;\n"
+      "attribute vec2 aTexCoord;\n"
+      "varying vec2 vTex;\n"
+      "void main() { gl_Position = vec4(aVertex, 0.0, 1.0); vTex = aTexCoord; }\n";
+
+   static const char *fragment_source =
+      "varying vec2 vTex;\n"
+      "uniform sampler2D sTex0;\n"
+      "uniform sampler2D sTex1;\n"
+      "uniform float uMix;\n"
+      "void main() { gl_FragColor = vec4(mix(texture2D(sTex0, vTex).rgb, texture2D(sTex1, vTex).rgb, uMix), 1.0); }\n";
+
+   glShaderSource(vert, 1, &vertex_source, NULL);
+   glShaderSource(frag, 1, &fragment_source, NULL);
+   glCompileShader(vert);
+   glCompileShader(frag);
+   glAttachShader(prog, vert);
+   glAttachShader(prog, frag);
+   glLinkProgram(prog);
+
+   glUseProgram(prog);
+
+   glUniform1i(glGetUniformLocation(prog, "sTex0"), 0);
+   glUniform1i(glGetUniformLocation(prog, "sTex1"), 1);
+   vertex_loc = glGetAttribLocation(prog, "aVertex");
+   tex_loc = glGetAttribLocation(prog, "aTexCoord");
+   mix_loc = glGetUniformLocation(prog, "uMix");
+
+   glUseProgram(0);
+
+   for (unsigned i = 0; i < 2; i++)
+   {
+      glGenTextures(1, &frames[i].tex);
+      glGenBuffers(1, &frames[i].pbo);
+
+      glBindTexture(GL_TEXTURE_2D, frames[i].tex);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, frames[i].pbo);
+      glBufferData(GL_PIXEL_UNPACK_BUFFER, media.width * media.height * sizeof(uint32_t), NULL, GL_STREAM_DRAW);
+   }
+
+   static const GLfloat vertex_data[] = {
+      -1, -1, 0, 0,
+       1, -1, 1, 0,
+      -1,  1, 0, 1,
+       1,  1, 1, 1,
+   };
+
+   glGenBuffers(1, &vbo);
+   glBindBuffer(GL_ARRAY_BUFFER, vbo);
+   glBufferData(GL_ARRAY_BUFFER, sizeof(vertex_data), vertex_data, GL_STATIC_DRAW);
+
+   glBindBuffer(GL_ARRAY_BUFFER, 0);
+   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+   glBindTexture(GL_TEXTURE_2D, 0);
+}
+
 bool retro_load_game(const struct retro_game_info *info)
 {
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
@@ -477,7 +617,14 @@ bool retro_load_game(const struct retro_game_info *info)
    decode_thread_dead = false;
 
    if (video_stream >= 0)
+   {
       video_decode_fifo = fifo_new(media.width * media.height * sizeof(uint32_t) * 32);
+
+      hw_render.context_reset = context_reset;
+      hw_render.context_type = RETRO_HW_CONTEXT_OPENGL;
+      if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))
+         LOG_ERR_GOTO("Cannot initialize HW render.", error);
+   }
    if (audio_stream >= 0)
       audio_decode_fifo = fifo_new(media.sample_rate * 2 * sizeof(int16_t) * 2);
 
@@ -520,7 +667,7 @@ void retro_unload_game(void)
    video_decode_fifo = NULL;
    audio_decode_fifo = NULL;
 
-   packet_pts = 0.0;
+   frames[0].pts = frames[1].pts = 0.0;
    pts_bias = 0.0;
    last_audio_pts = 0.0;
    frame_cnt = 0;
