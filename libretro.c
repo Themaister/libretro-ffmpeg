@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <assert.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -36,11 +37,19 @@ static scond_t *fifo_cond;
 static scond_t *fifo_decode_cond;
 static slock_t *fifo_lock;
 static sthread_t *decode_thread_handle;
+static double decode_last_video_time;
+static double decode_last_audio_time;
 
 static uint32_t *video_read_buffer;
 
 static double pts_bias;
 static double last_audio_pts;
+
+static bool main_sleeping;
+
+// Seeking.
+static bool do_seek;
+static double seek_time;
 
 // GL stuff
 static struct retro_hw_render_callback hw_render;
@@ -165,6 +174,51 @@ void retro_run(void)
 {
    input_poll_cb();
 
+   int seek_frames = 0;
+   static bool last_left;
+   static bool last_right;
+   bool left = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0,
+         RETRO_DEVICE_ID_JOYPAD_LEFT);
+   bool right = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0,
+         RETRO_DEVICE_ID_JOYPAD_RIGHT);
+
+   if (left && !last_left)
+      seek_frames -= 600;
+   if (right && !last_right)
+      seek_frames += 600;
+
+   last_left = left;
+   last_right = right;
+
+   // Push seek request to thread,
+   // wait for seek to complete.
+   if (seek_frames)
+   {
+      if (seek_frames < 0 && (unsigned)-seek_frames > frame_cnt)
+         frame_cnt = 0;
+      else
+         frame_cnt += seek_frames;
+
+      slock_lock(fifo_lock);
+
+      do_seek = true;
+      seek_time = frame_cnt / media.interpolate_fps;
+
+      frames[0].pts = 0.0;
+      frames[1].pts = 0.0;
+      audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
+
+      if (video_decode_fifo)
+         fifo_clear(video_decode_fifo);
+      if (audio_decode_fifo)
+         fifo_clear(audio_decode_fifo);
+      scond_signal(fifo_decode_cond);
+
+      while (!decode_thread_dead && do_seek)
+         scond_wait(fifo_cond, fifo_lock);
+      slock_unlock(fifo_lock);
+   }
+
    if (decode_thread_dead)
    {
       environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
@@ -189,7 +243,15 @@ void retro_run(void)
          slock_lock(fifo_lock);
          size_t to_read_frame_bytes = media.width * media.height * sizeof(uint32_t) + sizeof(int64_t);
          while (!decode_thread_dead && fifo_read_avail(video_decode_fifo) < to_read_frame_bytes)
+         {
+            //fprintf(stderr, "Main: Video fifo is empty.\n");
+            main_sleeping = true;
+            scond_signal(fifo_decode_cond);
             scond_wait(fifo_cond, fifo_lock);
+            main_sleeping = false;
+         }
+
+         //fprintf(stderr, "Main: Reading video frame.\n");
 
          int64_t pts = 0;
          if (!decode_thread_dead)
@@ -201,6 +263,9 @@ void retro_run(void)
                   0, media.width * media.height, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
 
             fifo_read(video_decode_fifo, data, media.width * media.height * sizeof(uint32_t));
+
+            fprintf(stderr, "Read frame, frames: #%zu\n", fifo_read_avail(video_decode_fifo) /
+                  to_read_frame_bytes);
 
             glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
             glBindTexture(GL_TEXTURE_2D, frames[1].tex);
@@ -223,6 +288,8 @@ void retro_run(void)
          //fprintf(stderr, "OLD: %.2f s\n", frames[0].pts);
          //fprintf(stderr, "PTS: %.2f s\n", frames[1].pts);
       }
+
+      //fprintf(stderr, "Main: Found suitable frame.\n");
 
       float mix_factor = (min_pts - frames[0].pts) / (frames[1].pts - frames[0].pts);
 
@@ -274,7 +341,13 @@ void retro_run(void)
 
       slock_lock(fifo_lock);
       while (!decode_thread_dead && fifo_read_avail(audio_decode_fifo) < to_read_bytes)
+      {
+         fprintf(stderr, "Main: Audio fifo is empty.\n");
+         main_sleeping = true;
+         scond_signal(fifo_decode_cond);
          scond_wait(fifo_cond, fifo_lock);
+         main_sleeping = false;
+      }
 
       int16_t audio_buffer[2048];
       if (!decode_thread_dead)
@@ -287,8 +360,6 @@ void retro_run(void)
          audio_batch_cb(audio_buffer, to_read_frames);
 
       audio_frames += to_read_frames;
-
-      pts_bias = +0.25; // Hack
    }
 }
 
@@ -365,7 +436,8 @@ static bool decode_video(AVPacket *pkt, AVFrame *frame, AVFrame *conv, struct Sw
 
    while (!got_ptr)
    {
-      if (avcodec_decode_video2(vctx, frame, &got_ptr, pkt) <= 0)
+      int ret = avcodec_decode_video2(vctx, frame, &got_ptr, pkt);
+      if (ret <= 0)
       {
          if (retry_cnt++ < 4)
             continue;
@@ -413,6 +485,48 @@ static int16_t *decode_audio(AVPacket *pkt, AVFrame *frame, int16_t *buffer, siz
    *written_bytes = required_buffer;
 
    return buffer;
+}
+
+static void decode_thread_seek(double time)
+{
+   int flags = 0;
+   double seek_to = 0.0;
+   int stream = -1;
+
+   if (video_stream >= 0)
+   {
+      stream = video_stream;
+      double tb = 1.0 / av_q2d(fctx->streams[video_stream]->time_base);
+      seek_to = time * tb;
+      if (time < decode_last_video_time)
+         flags = AVSEEK_FLAG_BACKWARD;
+
+   }
+   else if (audio_stream >= 0)
+   {
+      stream = audio_stream;
+      double tb = 1.0 / av_q2d(fctx->streams[audio_stream]->time_base);
+      seek_to = time * tb;
+      if (time < decode_last_audio_time)
+         flags = AVSEEK_FLAG_BACKWARD;
+   }
+
+   if (seek_to < 0.0)
+      seek_to = 0.0;
+
+   decode_last_video_time = time;
+   decode_last_audio_time = time;
+
+   int ret = av_seek_frame(fctx, stream, seek_to, flags);
+   if (ret < 0)
+      fprintf(stderr, "av_seek_frame() failed.\n");
+   else
+      fprintf(stderr, "Seeking successful to %.2f!\n", time);
+
+   if (actx)
+      avcodec_flush_buffers(actx);
+   if (vctx)
+      avcodec_flush_buffers(vctx);
 }
 
 static void decode_thread(void *data)
@@ -466,16 +580,50 @@ static void decode_thread(void *data)
       if (av_read_frame(fctx, &pkt) < 0)
          break;
 
+      slock_lock(fifo_lock);
+      bool seek = do_seek;
+      double seek_time_thread = seek_time;
+      slock_unlock(fifo_lock);
+
+      if (seek)
+      {
+         decode_thread_seek(seek_time_thread);
+
+         slock_lock(fifo_lock);
+         do_seek = false;
+         seek_time = 0.0;
+
+         if (video_decode_fifo)
+            fifo_clear(video_decode_fifo);
+         if (audio_decode_fifo)
+            fifo_clear(audio_decode_fifo);
+
+         scond_signal(fifo_cond);
+         slock_unlock(fifo_lock);
+      }
+
       if (pkt.stream_index == video_stream)
       {
          if (decode_video(&pkt, vid_frame, conv_frame, sws))
          {
-            int64_t pts = vid_frame->pts;
+            int64_t pts = av_frame_get_best_effort_timestamp(vid_frame);
+            decode_last_video_time = pts * av_q2d(fctx->streams[video_stream]->time_base);
+            //fprintf(stderr, "Got video frame PTS: %.2f.\n", decode_last_video_time);
 
             size_t decoded_size = frame_size + sizeof(pts);
             slock_lock(fifo_lock);
             while (!decode_thread_dead && fifo_write_avail(video_decode_fifo) < decoded_size)
-               scond_wait(fifo_decode_cond, fifo_lock);
+            {
+               //fprintf(stderr, "Thread: Video fifo is full ...\n");
+               if (!main_sleeping)
+                  scond_wait(fifo_decode_cond, fifo_lock);
+               else
+               {
+                  fprintf(stderr, "Thread: Video deadlock detected ...\n");
+                  fifo_clear(video_decode_fifo);
+                  break;
+               }
+            }
 
             if (!decode_thread_dead)
             {
@@ -484,6 +632,9 @@ static void decode_thread(void *data)
                int stride = conv_frame->linesize[0];
                for (unsigned y = 0; y < media.height; y++, src += stride)
                   fifo_write(video_decode_fifo, src, media.width * sizeof(uint32_t));
+
+               fprintf(stderr, "Wrote frame, frames: #%zu\n", fifo_read_avail(video_decode_fifo) /
+                     decoded_size);
             }
             scond_signal(fifo_cond);
             slock_unlock(fifo_lock);
@@ -497,9 +648,23 @@ static void decode_thread(void *data)
                &decoded_size,
                swr);
 
+         int64_t pts = av_frame_get_best_effort_timestamp(aud_frame);
+         decode_last_audio_time = pts * av_q2d(fctx->streams[audio_stream]->time_base);
+         //fprintf(stderr, "Got audio frame PTS: %.2f.\n", decode_last_audio_time);
+
          slock_lock(fifo_lock);
          while (!decode_thread_dead && fifo_write_avail(audio_decode_fifo) < decoded_size)
-            scond_wait(fifo_decode_cond, fifo_lock);
+         {
+            //fprintf(stderr, "Thread: Audio fifo is full ...\n");
+            if (!main_sleeping)
+               scond_wait(fifo_decode_cond, fifo_lock);
+            else
+            {
+               fprintf(stderr, "Thread: Audio deadlock detected ...\n");
+               fifo_clear(audio_decode_fifo);
+               break;
+            }
+         }
 
          if (!decode_thread_dead)
             fifo_write(audio_decode_fifo, audio_buffer, decoded_size);
@@ -618,7 +783,7 @@ bool retro_load_game(const struct retro_game_info *info)
 
    if (video_stream >= 0)
    {
-      video_decode_fifo = fifo_new(media.width * media.height * sizeof(uint32_t) * 32);
+      video_decode_fifo = fifo_new(media.width * media.height * sizeof(uint32_t) * 64);
 
       hw_render.context_reset = context_reset;
       hw_render.context_type = RETRO_HW_CONTEXT_OPENGL;
@@ -626,7 +791,7 @@ bool retro_load_game(const struct retro_game_info *info)
          LOG_ERR_GOTO("Cannot initialize HW render.", error);
    }
    if (audio_stream >= 0)
-      audio_decode_fifo = fifo_new(media.sample_rate * 2 * sizeof(int16_t) * 2);
+      audio_decode_fifo = fifo_new(2 * media.sample_rate * 2 * sizeof(int16_t) * 2);
 
    fifo_cond = scond_new();
    fifo_decode_cond = scond_new();
@@ -635,6 +800,8 @@ bool retro_load_game(const struct retro_game_info *info)
    video_read_buffer = av_malloc(media.width * media.height * sizeof(uint32_t));
 
    decode_thread_handle = sthread_create(decode_thread, NULL);
+
+   pts_bias = 0.0; // Hack
 
    return true;
 
@@ -666,6 +833,9 @@ void retro_unload_game(void)
    fifo_lock = NULL;
    video_decode_fifo = NULL;
    audio_decode_fifo = NULL;
+
+   decode_last_video_time = 0.0;
+   decode_last_audio_time = 0.0;
 
    frames[0].pts = frames[1].pts = 0.0;
    pts_bias = 0.0;
