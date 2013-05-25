@@ -43,7 +43,6 @@ static double decode_last_audio_time;
 static uint32_t *video_read_buffer;
 
 static double pts_bias;
-static double last_audio_pts;
 
 static bool main_sleeping;
 
@@ -264,8 +263,8 @@ void retro_run(void)
 
             fifo_read(video_decode_fifo, data, media.width * media.height * sizeof(uint32_t));
 
-            fprintf(stderr, "Read frame, frames: #%zu\n", fifo_read_avail(video_decode_fifo) /
-                  to_read_frame_bytes);
+            //fprintf(stderr, "Read frame, frames: #%zu\n", fifo_read_avail(video_decode_fifo) /
+            //      to_read_frame_bytes);
 
             glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
             glBindTexture(GL_TEXTURE_2D, frames[1].tex);
@@ -278,15 +277,7 @@ void retro_run(void)
          scond_signal(fifo_decode_cond);
          slock_unlock(fifo_lock);
 
-         if (pts != AV_NOPTS_VALUE)
-            frames[1].pts = av_q2d(fctx->streams[video_stream]->time_base) * pts;
-         else if (frames[1].pts < frames[0].pts)
-            frames[1].pts = frames[0].pts + 1.0 / media.fps;
-         else
-            frames[1].pts += 1.0 / media.fps;
-
-         //fprintf(stderr, "OLD: %.2f s\n", frames[0].pts);
-         //fprintf(stderr, "PTS: %.2f s\n", frames[1].pts);
+         frames[1].pts = av_q2d(fctx->streams[video_stream]->time_base) * pts;
       }
 
       //fprintf(stderr, "Main: Found suitable frame.\n");
@@ -342,11 +333,25 @@ void retro_run(void)
       slock_lock(fifo_lock);
       while (!decode_thread_dead && fifo_read_avail(audio_decode_fifo) < to_read_bytes)
       {
-         fprintf(stderr, "Main: Audio fifo is empty.\n");
+         //fprintf(stderr, "Main: Audio fifo is empty.\n");
          main_sleeping = true;
          scond_signal(fifo_decode_cond);
          scond_wait(fifo_cond, fifo_lock);
          main_sleeping = false;
+      }
+
+      double reading_pts = decode_last_audio_time -
+         (double)fifo_read_avail(audio_decode_fifo) / (media.sample_rate * sizeof(int16_t) * 2);
+
+      double expected_pts = (double)expected_audio_frames / media.sample_rate;
+
+      double old_pts_bias = pts_bias;
+      pts_bias = reading_pts - expected_pts;
+      if (pts_bias < old_pts_bias - 1.0)
+      {
+         frames[0].pts = 0.0;
+         frames[1].pts = 0.0;
+         fprintf(stderr, "Expect delay: %.2f s.\n", old_pts_bias - pts_bias);
       }
 
       int16_t audio_buffer[2048];
@@ -419,8 +424,8 @@ static bool init_media_info(void)
    media.interpolate_fps = 60.0;
    if (vctx)
    {
-      media.fps = 1.0 / (vctx->ticks_per_frame * av_q2d(vctx->time_base));
-      fprintf(stderr, "FPS: %.3f\n", media.fps);
+      //media.fps = 1.0 / (vctx->ticks_per_frame * av_q2d(vctx->time_base));
+      //fprintf(stderr, "FPS: %.3f\n", media.fps);
       media.width  = vctx->width;
       media.height = vctx->height;
       media.aspect = (float)vctx->width * av_q2d(vctx->sample_aspect_ratio) / vctx->height;
@@ -496,7 +501,7 @@ static void decode_thread_seek(double time)
    if (video_stream >= 0)
    {
       stream = video_stream;
-      double tb = 1.0 / av_q2d(fctx->streams[video_stream]->time_base);
+      double tb = 1.0 / (av_q2d(fctx->streams[video_stream]->time_base) * vctx->ticks_per_frame);
       seek_to = time * tb;
       if (time < decode_last_video_time)
          flags = AVSEEK_FLAG_BACKWARD;
@@ -607,7 +612,6 @@ static void decode_thread(void *data)
          if (decode_video(&pkt, vid_frame, conv_frame, sws))
          {
             int64_t pts = av_frame_get_best_effort_timestamp(vid_frame);
-            decode_last_video_time = pts * av_q2d(fctx->streams[video_stream]->time_base);
             //fprintf(stderr, "Got video frame PTS: %.2f.\n", decode_last_video_time);
 
             size_t decoded_size = frame_size + sizeof(pts);
@@ -619,12 +623,13 @@ static void decode_thread(void *data)
                   scond_wait(fifo_decode_cond, fifo_lock);
                else
                {
-                  fprintf(stderr, "Thread: Video deadlock detected ...\n");
+                  //fprintf(stderr, "Thread: Video deadlock detected ...\n");
                   fifo_clear(video_decode_fifo);
                   break;
                }
             }
 
+            decode_last_video_time = pts * av_q2d(fctx->streams[video_stream]->time_base);
             if (!decode_thread_dead)
             {
                fifo_write(video_decode_fifo, &pts, sizeof(pts));
@@ -633,8 +638,8 @@ static void decode_thread(void *data)
                for (unsigned y = 0; y < media.height; y++, src += stride)
                   fifo_write(video_decode_fifo, src, media.width * sizeof(uint32_t));
 
-               fprintf(stderr, "Wrote frame, frames: #%zu\n", fifo_read_avail(video_decode_fifo) /
-                     decoded_size);
+               //fprintf(stderr, "Wrote frame, frames: #%zu\n", fifo_read_avail(video_decode_fifo) /
+               //      decoded_size);
             }
             scond_signal(fifo_cond);
             slock_unlock(fifo_lock);
@@ -649,7 +654,6 @@ static void decode_thread(void *data)
                swr);
 
          int64_t pts = av_frame_get_best_effort_timestamp(aud_frame);
-         decode_last_audio_time = pts * av_q2d(fctx->streams[audio_stream]->time_base);
          //fprintf(stderr, "Got audio frame PTS: %.2f.\n", decode_last_audio_time);
 
          slock_lock(fifo_lock);
@@ -666,10 +670,10 @@ static void decode_thread(void *data)
             }
          }
 
+         decode_last_audio_time = pts * av_q2d(fctx->streams[audio_stream]->time_base);
          if (!decode_thread_dead)
             fifo_write(audio_decode_fifo, audio_buffer, decoded_size);
 
-         last_audio_pts = aud_frame->pts;
          scond_signal(fifo_cond);
          slock_unlock(fifo_lock);
       }
@@ -783,7 +787,7 @@ bool retro_load_game(const struct retro_game_info *info)
 
    if (video_stream >= 0)
    {
-      video_decode_fifo = fifo_new(media.width * media.height * sizeof(uint32_t) * 64);
+      video_decode_fifo = fifo_new(media.width * media.height * sizeof(uint32_t) * 32);
 
       hw_render.context_reset = context_reset;
       hw_render.context_type = RETRO_HW_CONTEXT_OPENGL;
@@ -791,7 +795,7 @@ bool retro_load_game(const struct retro_game_info *info)
          LOG_ERR_GOTO("Cannot initialize HW render.", error);
    }
    if (audio_stream >= 0)
-      audio_decode_fifo = fifo_new(2 * media.sample_rate * 2 * sizeof(int16_t) * 2);
+      audio_decode_fifo = fifo_new(10 * media.sample_rate * sizeof(int16_t) * 2);
 
    fifo_cond = scond_new();
    fifo_decode_cond = scond_new();
@@ -839,7 +843,6 @@ void retro_unload_game(void)
 
    frames[0].pts = frames[1].pts = 0.0;
    pts_bias = 0.0;
-   last_audio_pts = 0.0;
    frame_cnt = 0;
    audio_frames = 0;
 
