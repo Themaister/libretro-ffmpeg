@@ -14,6 +14,7 @@
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
 #include <libswresample/swresample.h>
+#include <ass/ass.h>
 
 #include <GL/glew.h>
 
@@ -21,15 +22,35 @@
    fprintf(stderr, "[FFmpeg]: " msg "\n"); goto label; \
 } while(0)
 
+// FFmpeg context data.
 static AVFormatContext *fctx;
 static AVCodecContext *vctx;
 static AVCodecContext *actx;
+static AVCodecContext *sctx;
 static int video_stream;
 static int audio_stream;
+static int subtitle_stream;
 
+// AAS/SSA subtitles.
+static ASS_Library *ass;
+static ASS_Renderer *ass_render;
+static ASS_Track *ass_track;
+static uint8_t *ass_extra_data;
+static size_t ass_extra_data_size;
+struct attachment
+{
+   uint8_t *data;
+   size_t size;
+};
+static struct attachment *attachments;
+static size_t attachments_size;
+
+// A/V timing.
 static uint64_t frame_cnt;
 static uint64_t audio_frames;
+static double pts_bias;
 
+// Threaded FIFOs.
 static volatile bool decode_thread_dead;
 static fifo_buffer_t *video_decode_fifo;
 static fifo_buffer_t *audio_decode_fifo;
@@ -39,10 +60,6 @@ static slock_t *fifo_lock;
 static sthread_t *decode_thread_handle;
 static double decode_last_video_time;
 static double decode_last_audio_time;
-
-static uint32_t *video_read_buffer;
-
-static double pts_bias;
 
 static bool main_sleeping;
 
@@ -80,6 +97,24 @@ static struct
 
    float aspect;
 } media;
+
+static void ass_msg_cb(int level, const char *fmt, va_list args, void *data)
+{
+   (void)data;
+   if (level < 6)
+      vfprintf(stderr, fmt, args);
+}
+
+static void append_attachment(const uint8_t *data, size_t size)
+{
+   attachments = av_realloc(attachments, (attachments_size + 1) * sizeof(*attachments));
+
+   attachments[attachments_size].data = av_malloc(size);
+   attachments[attachments_size].size = size;
+   memcpy(attachments[attachments_size].data, data, size);
+
+   attachments_size++;
+}
 
 void retro_init(void)
 {
@@ -195,7 +230,6 @@ void retro_run(void)
       seek_frames += 60 * media.interpolate_fps;
    if (down && !last_down)
       seek_frames -= 60 * media.interpolate_fps;
-
 
    last_left = left;
    last_right = right;
@@ -401,6 +435,7 @@ static bool open_codecs(void)
 {
    video_stream = -1;
    audio_stream = -1;
+   subtitle_stream = -1;
 
    for (unsigned i = 0; i < fctx->nb_streams; i++)
    {
@@ -424,6 +459,32 @@ static bool open_codecs(void)
             }
             break;
 
+         case AVMEDIA_TYPE_SUBTITLE:
+            if (!sctx && fctx->streams[i]->codec->codec_id == CODEC_ID_SSA)
+            {
+               if (!open_codec(&sctx, i))
+                  return false;
+               subtitle_stream = i;
+
+               ass_extra_data_size = sctx->extradata ? sctx->extradata_size : 0;
+
+               if (ass_extra_data_size)
+               {
+                  ass_extra_data = av_malloc(ass_extra_data_size);
+                  memcpy(ass_extra_data, sctx->extradata,
+                        ass_extra_data_size);
+               }
+            }
+            break;
+
+         case AVMEDIA_TYPE_ATTACHMENT:
+         {
+            AVCodecContext *ctx = fctx->streams[i]->codec;
+            if (ctx->codec_id == CODEC_ID_TTF)
+               append_attachment(ctx->extradata, ctx->extradata_size);
+            break;
+         }
+
          default:
             break;
       }
@@ -445,6 +506,24 @@ static bool init_media_info(void)
       media.width  = vctx->width;
       media.height = vctx->height;
       media.aspect = (float)vctx->width * av_q2d(vctx->sample_aspect_ratio) / vctx->height;
+   }
+
+   if (sctx)
+   {
+      ass = ass_library_init();
+      ass_set_message_cb(ass, ass_msg_cb, NULL);
+      for (size_t i = 0; i < attachments_size; i++)
+         ass_add_font(ass, (char*)"", (char*)attachments[i].data, attachments[i].size);
+
+      ass_render = ass_renderer_init(ass);
+      ass_set_frame_size(ass_render, media.width, media.height);
+      ass_set_extract_fonts(ass, true);
+      ass_set_fonts(ass_render, NULL, NULL, 1, NULL, 1);
+      ass_set_hinting(ass_render, ASS_HINTING_LIGHT);
+
+      ass_track = ass_new_track(ass);
+      ass_process_codec_private(ass_track, (char*)ass_extra_data,
+            ass_extra_data_size);
    }
 
    return true;
@@ -549,6 +628,51 @@ static void decode_thread_seek(double time)
    // Causes H.264 to crash for some reason ...
    //if (vctx)
    //   avcodec_flush_buffers(vctx);
+   if (ass_track)
+      ass_flush_events(ass_track);
+}
+
+// Straight CPU alpha blending.
+// Should probably do in GL.
+static void render_ass_img(AVFrame *conv_frame, ASS_Image *img)
+{
+   uint32_t *frame = (uint32_t*)conv_frame->data[0];
+   int stride = conv_frame->linesize[0] / sizeof(uint32_t);
+
+   for (; img; img = img->next)
+   {
+      if (img->w == 0 && img->h == 0)
+         continue;
+
+      const uint8_t *bitmap = img->bitmap;
+      uint32_t *dst = frame + img->dst_x + img->dst_y * stride;
+
+      unsigned r = (img->color >> 24) & 0xff;
+      unsigned g = (img->color >> 16) & 0xff;
+      unsigned b = (img->color >>  8) & 0xff;
+      unsigned a = 255 - (img->color & 0xff);
+
+      for (int y = 0; y < img->h; y++,
+            bitmap += img->stride, dst += stride)
+      {
+         for (int x = 0; x < img->w; x++)
+         {
+            unsigned src_alpha = ((bitmap[x] * (a + 1)) >> 8) + 1;
+            unsigned dst_alpha = 256 - src_alpha;
+
+            uint32_t dst_color = dst[x];
+            unsigned dst_r = (dst_color >> 16) & 0xff;
+            unsigned dst_g = (dst_color >>  8) & 0xff;
+            unsigned dst_b = (dst_color >>  0) & 0xff;
+
+            dst_r = (r * src_alpha + dst_r * dst_alpha) >> 8;
+            dst_g = (g * src_alpha + dst_g * dst_alpha) >> 8;
+            dst_b = (b * src_alpha + dst_b * dst_alpha) >> 8;
+
+            dst[x] = (0xffu << 24) | (dst_r << 16) | (dst_g << 8) | (dst_b << 0);
+         }
+      }
+   }
 }
 
 static void decode_thread(void *data)
@@ -599,6 +723,7 @@ static void decode_thread(void *data)
    while (!decode_thread_dead)
    {
       AVPacket pkt;
+      memset(&pkt, 0, sizeof(pkt));
       if (av_read_frame(fctx, &pkt) < 0)
          break;
 
@@ -631,6 +756,19 @@ static void decode_thread(void *data)
             int64_t pts = av_frame_get_best_effort_timestamp(vid_frame);
             //fprintf(stderr, "Got video frame PTS: %.2f.\n", decode_last_video_time);
 
+            double video_time = pts * av_q2d(fctx->streams[video_stream]->time_base);
+            if (ass_render)
+            {
+               int change = 0;
+               ASS_Image *img = ass_render_frame(ass_render, ass_track,
+                     1000 * video_time, &change);
+
+               //fprintf(stderr, "Rendering ASS image: %p.\n", (void*)img);
+               // Do it on CPU for now.
+               // We're in a thread anyways, so shouldn't really matter.
+               render_ass_img(conv_frame, img);
+            }
+
             size_t decoded_size = frame_size + sizeof(pts);
             slock_lock(fifo_lock);
             while (!decode_thread_dead && fifo_write_avail(video_decode_fifo) < decoded_size)
@@ -646,7 +784,7 @@ static void decode_thread(void *data)
                }
             }
 
-            decode_last_video_time = pts * av_q2d(fctx->streams[video_stream]->time_base);
+            decode_last_video_time = video_time;
             if (!decode_thread_dead)
             {
                fifo_write(video_decode_fifo, &pts, sizeof(pts));
@@ -693,6 +831,29 @@ static void decode_thread(void *data)
 
          scond_signal(fifo_cond);
          slock_unlock(fifo_lock);
+      }
+      else if (pkt.stream_index == subtitle_stream)
+      {
+         AVSubtitle sub;
+         memset(&sub, 0, sizeof(sub));
+
+         int finished = 0;
+         while (!finished)
+         {
+            if (avcodec_decode_subtitle2(sctx, &sub, &finished, &pkt) < 0)
+            {
+               fprintf(stderr, "Decode subtitles failed.\n");
+               break;
+            }
+         }
+
+         for (int i = 0; i < sub.num_rects; i++)
+         {
+            if (sub.rects[i]->ass)
+               ass_process_data(ass_track, sub.rects[i]->ass, strlen(sub.rects[i]->ass));
+         }
+
+         avsubtitle_free(&sub);
       }
 
       av_free_packet(&pkt);
@@ -818,8 +979,6 @@ bool retro_load_game(const struct retro_game_info *info)
    fifo_decode_cond = scond_new();
    fifo_lock = slock_new();
 
-   video_read_buffer = av_malloc(media.width * media.height * sizeof(uint32_t));
-
    decode_thread_handle = sthread_create(decode_thread, NULL);
 
    pts_bias = 0.0; // Hack
@@ -863,7 +1022,11 @@ void retro_unload_game(void)
    frame_cnt = 0;
    audio_frames = 0;
 
-   av_freep(&video_read_buffer);
+   if (sctx)
+   {
+      avcodec_close(sctx);
+      sctx = NULL;
+   }
 
    if (actx)
    {
@@ -882,6 +1045,25 @@ void retro_unload_game(void)
       avformat_close_input(&fctx);
       fctx = NULL;
    }
+
+   av_freep(&ass_extra_data);
+   ass_extra_data_size = 0;
+
+   for (size_t i = 0; i < attachments_size; i++)
+      av_freep(&attachments[i].data);
+   av_freep(&attachments);
+   attachments_size = 0;
+
+   if (ass_track)
+      ass_free_track(ass_track);
+   if (ass_render)
+      ass_renderer_done(ass_render);
+   if (ass)
+      ass_library_done(ass);
+
+   ass_track = NULL;
+   ass_render = NULL;
+   ass = NULL;
 }
 
 unsigned retro_get_region(void)
