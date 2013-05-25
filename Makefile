@@ -1,4 +1,4 @@
-TARGET := libretro-ffmpeg.so
+TARGET := ffmpeg_libretro.so
 
 SOURCE := $(wildcard *.c)
 OBJECTS := $(SOURCE:.c=.o)
