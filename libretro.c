@@ -615,35 +615,14 @@ static int16_t *decode_audio(AVPacket *pkt, AVFrame *frame, int16_t *buffer, siz
 
 static void decode_thread_seek(double time)
 {
-   int flags = 0;
-   double seek_to = 0.0;
-   int stream = -1;
-
-   if (video_stream >= 0)
-   {
-      stream = video_stream;
-      double tb = 1.0 / av_q2d(fctx->streams[video_stream]->time_base);
-      seek_to = time * tb;
-      if (time < decode_last_video_time)
-         flags = AVSEEK_FLAG_BACKWARD;
-
-   }
-   else if (audio_stream >= 0)
-   {
-      stream = audio_stream;
-      double tb = 1.0 / av_q2d(fctx->streams[audio_stream]->time_base);
-      seek_to = time * tb;
-      if (time < decode_last_audio_time)
-         flags = AVSEEK_FLAG_BACKWARD;
-   }
-
-   if (seek_to < 0.0)
-      seek_to = 0.0;
+   int64_t seek_to = time * AV_TIME_BASE;
+   if (seek_to < 0)
+      seek_to = 0;
 
    decode_last_video_time = time;
    decode_last_audio_time = time;
 
-   int ret = avformat_seek_file(fctx, stream, INT64_MIN, seek_to, INT64_MAX, flags);
+   int ret = avformat_seek_file(fctx, -1, INT64_MIN, seek_to, INT64_MAX, 0);
    if (ret < 0)
       fprintf(stderr, "av_seek_frame() failed.\n");
 
