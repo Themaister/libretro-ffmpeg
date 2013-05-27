@@ -16,7 +16,7 @@
 #include <libswresample/swresample.h>
 #include <ass/ass.h>
 
-#include <GL/glew.h>
+#include "glsym.h"
 
 #define LOG_ERR_GOTO(msg, label) do { \
    fprintf(stderr, "[FFmpeg]: " msg "\n"); goto label; \
@@ -61,6 +61,10 @@ static sthread_t *decode_thread_handle;
 static double decode_last_video_time;
 static double decode_last_audio_time;
 
+#ifdef GLES
+static uint32_t *video_frame_temp_buffer;
+#endif
+
 static bool main_sleeping;
 
 // Seeking.
@@ -72,7 +76,9 @@ static struct retro_hw_render_callback hw_render;
 struct frame
 {
    GLuint tex;
+#ifndef GLES
    GLuint pbo;
+#endif
    double pts;
 };
 
@@ -353,14 +359,18 @@ void retro_run(void)
          {
             fifo_read(video_decode_fifo, &pts, sizeof(int64_t));
 
+#ifdef GLES
+            fifo_read(video_decode_fifo, video_frame_temp_buffer, media.width * media.height * sizeof(uint32_t));
+            glBindTexture(GL_TEXTURE_2D, frames[1].tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                  media.width, media.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, video_frame_temp_buffer);
+            glBindTexture(GL_TEXTURE_2D, 0);
+#else
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, frames[1].pbo);
             uint32_t *data = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER,
                   0, media.width * media.height, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
 
             fifo_read(video_decode_fifo, data, media.width * media.height * sizeof(uint32_t));
-
-            //fprintf(stderr, "Read frame, frames: #%zu\n", fifo_read_avail(video_decode_fifo) /
-            //      to_read_frame_bytes);
 
             glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
             glBindTexture(GL_TEXTURE_2D, frames[1].tex);
@@ -368,6 +378,7 @@ void retro_run(void)
                   media.width, media.height, 0, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
             glBindTexture(GL_TEXTURE_2D, 0);
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+#endif
          }
 
          scond_signal(fifo_decode_cond);
@@ -854,7 +865,8 @@ static void decode_thread(void *data)
 
 static void context_reset(void)
 {
-   glewInit();
+   glsym_init_procs(hw_render.get_proc_address);
+
    prog = glCreateProgram();
    GLuint vert = glCreateShader(GL_VERTEX_SHADER);
    GLuint frag = glCreateShader(GL_FRAGMENT_SHADER);
@@ -866,11 +878,19 @@ static void context_reset(void)
       "void main() { gl_Position = vec4(aVertex, 0.0, 1.0); vTex = aTexCoord; }\n";
 
    static const char *fragment_source =
+      "#ifdef GL_ES\n"
+      "precision mediump float;\n"
+      "#endif\n"
       "varying vec2 vTex;\n"
       "uniform sampler2D sTex0;\n"
       "uniform sampler2D sTex1;\n"
       "uniform float uMix;\n"
+#ifdef GLES
+      "void main() { gl_FragColor = vec4(mix(texture2D(sTex0, vTex).bgr, texture2D(sTex1, vTex).bgr, uMix), 1.0); }\n";
+      // Get format as GL_RGBA/GL_UNSIGNED_BYTE. Assume little endian, so we get ARGB -> BGRA byte order, and we have to swizzle to .BGR.
+#else
       "void main() { gl_FragColor = vec4(mix(texture2D(sTex0, vTex).rgb, texture2D(sTex1, vTex).rgb, uMix), 1.0); }\n";
+#endif
 
    glShaderSource(vert, 1, &vertex_source, NULL);
    glShaderSource(frag, 1, &fragment_source, NULL);
@@ -893,7 +913,6 @@ static void context_reset(void)
    for (unsigned i = 0; i < 2; i++)
    {
       glGenTextures(1, &frames[i].tex);
-      glGenBuffers(1, &frames[i].pbo);
 
       glBindTexture(GL_TEXTURE_2D, frames[i].tex);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -901,8 +920,12 @@ static void context_reset(void)
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
+#ifndef GLES
+      glGenBuffers(1, &frames[i].pbo);
       glBindBuffer(GL_PIXEL_UNPACK_BUFFER, frames[i].pbo);
       glBufferData(GL_PIXEL_UNPACK_BUFFER, media.width * media.height * sizeof(uint32_t), NULL, GL_STREAM_DRAW);
+      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+#endif
    }
 
    static const GLfloat vertex_data[] = {
@@ -917,7 +940,6 @@ static void context_reset(void)
    glBufferData(GL_ARRAY_BUFFER, sizeof(vertex_data), vertex_data, GL_STATIC_DRAW);
 
    glBindBuffer(GL_ARRAY_BUFFER, 0);
-   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
@@ -946,7 +968,11 @@ bool retro_load_game(const struct retro_game_info *info)
       video_decode_fifo = fifo_new(media.width * media.height * sizeof(uint32_t) * 32);
 
       hw_render.context_reset = context_reset;
+#ifdef GLES
+      hw_render.context_type = RETRO_HW_CONTEXT_OPENGLES2;
+#else
       hw_render.context_type = RETRO_HW_CONTEXT_OPENGL;
+#endif
       if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))
          LOG_ERR_GOTO("Cannot initialize HW render.", error);
    }
@@ -959,7 +985,11 @@ bool retro_load_game(const struct retro_game_info *info)
 
    decode_thread_handle = sthread_create(decode_thread, NULL);
 
-   pts_bias = 0.0; // Hack
+#ifdef GLES
+   video_frame_temp_buffer = av_malloc(media.width * media.height * sizeof(uint32_t));
+#endif
+
+   pts_bias = 0.0;
 
    return true;
 
@@ -1042,6 +1072,10 @@ void retro_unload_game(void)
    ass_track = NULL;
    ass_render = NULL;
    ass = NULL;
+
+#ifdef GLES
+   av_freep(&video_frame_temp_buffer);
+#endif
 }
 
 unsigned retro_get_region(void)
