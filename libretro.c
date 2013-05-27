@@ -250,8 +250,12 @@ void retro_run(void)
       do_seek = true;
       seek_time = frame_cnt / media.interpolate_fps;
 
-      frames[0].pts = 0.0;
-      frames[1].pts = 0.0;
+      if (seek_frames < 0)
+      {
+         fprintf(stderr, "Resetting PTS.\n");
+         frames[0].pts = 0.0;
+         frames[1].pts = 0.0;
+      }
       audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
 
       if (video_decode_fifo)
@@ -304,6 +308,7 @@ void retro_run(void)
       pts_bias = reading_pts - expected_pts;
       if (pts_bias < old_pts_bias - 1.0)
       {
+         fprintf(stderr, "Resetting PTS (bias).\n");
          frames[0].pts = 0.0;
          frames[1].pts = 0.0;
          //fprintf(stderr, "Expect delay: %.2f s.\n", old_pts_bias - pts_bias);
@@ -531,58 +536,79 @@ static bool init_media_info(void)
 
 static bool decode_video(AVPacket *pkt, AVFrame *frame, AVFrame *conv, struct SwsContext *sws)
 {
-   unsigned retry_cnt = 0;
    int got_ptr = 0;
+   avcodec_get_frame_defaults(frame);
+   int ret = avcodec_decode_video2(vctx, frame, &got_ptr, pkt);
+   if (ret < 0)
+      return false;
 
-   while (!got_ptr)
+   if (got_ptr)
    {
-      int ret = avcodec_decode_video2(vctx, frame, &got_ptr, pkt);
-      if (ret <= 0)
-      {
-         if (retry_cnt++ < 4)
-            continue;
-
-         return false;
-      }
+      sws_scale(sws, (const uint8_t * const*)frame->data, frame->linesize, 0, media.height,
+            conv->data, conv->linesize);
+      return true;
    }
-
-   sws_scale(sws, (const uint8_t * const*)frame->data, frame->linesize, 0, media.height,
-         conv->data, conv->linesize);
-   return true;
+   else
+      return false;
 }
 
 static int16_t *decode_audio(AVPacket *pkt, AVFrame *frame, int16_t *buffer, size_t *buffer_cap,
-      size_t *written_bytes,
       SwrContext *swr)
 {
-   unsigned retry_cnt = 0;
+   avcodec_get_frame_defaults(frame);
+   AVPacket pkt_tmp = *pkt;
+
    int got_ptr = 0;
 
-   while (!got_ptr)
+   for (;;)
    {
-      if (avcodec_decode_audio4(actx, frame, &got_ptr, pkt) < 0)
-      {
-         if (retry_cnt++ < 4)
-            continue;
-
+      int ret = 0;
+      ret = avcodec_decode_audio4(actx, frame, &got_ptr, &pkt_tmp);
+      if (ret < 0)
          return buffer;
+
+      pkt_tmp.data += ret;
+      pkt_tmp.size -= ret;
+
+      if (!got_ptr)
+         break;
+
+      size_t required_buffer = frame->nb_samples * sizeof(int16_t) * 2;
+      if (required_buffer > *buffer_cap)
+      {
+         buffer = av_realloc(buffer, required_buffer);
+         *buffer_cap = required_buffer;
       }
+
+      swr_convert(swr,
+            (uint8_t*[]) { (uint8_t*)buffer },
+            frame->nb_samples,
+            (const uint8_t**)frame->data,
+            frame->nb_samples);
+
+      int64_t pts = av_frame_get_best_effort_timestamp(frame);
+
+      slock_lock(fifo_lock);
+      while (!decode_thread_dead && fifo_write_avail(audio_decode_fifo) < required_buffer)
+      {
+         //fprintf(stderr, "Thread: Audio fifo is full ...\n");
+         if (!main_sleeping)
+            scond_wait(fifo_decode_cond, fifo_lock);
+         else
+         {
+            fprintf(stderr, "Thread: Audio deadlock detected ...\n");
+            fifo_clear(audio_decode_fifo);
+            break;
+         }
+      }
+
+      decode_last_audio_time = pts * av_q2d(fctx->streams[audio_stream]->time_base);
+      if (!decode_thread_dead)
+         fifo_write(audio_decode_fifo, buffer, required_buffer);
+
+      scond_signal(fifo_cond);
+      slock_unlock(fifo_lock);
    }
-
-   size_t required_buffer = frame->nb_samples * sizeof(int16_t) * 2;
-   if (required_buffer > *buffer_cap)
-   {
-      buffer = av_realloc(buffer, required_buffer);
-      *buffer_cap = required_buffer;
-   }
-
-   swr_convert(swr,
-         (uint8_t*[]) { (uint8_t*)buffer },
-         frame->nb_samples,
-         (const uint8_t**)frame->data,
-         frame->nb_samples);
-
-   *written_bytes = required_buffer;
 
    return buffer;
 }
@@ -620,14 +646,13 @@ static void decode_thread_seek(double time)
    int ret = av_seek_frame(fctx, stream, seek_to, flags);
    if (ret < 0)
       fprintf(stderr, "av_seek_frame() failed.\n");
-   //else
-   //   fprintf(stderr, "Seeking successful to %.2f!\n", time);
 
    if (actx)
       avcodec_flush_buffers(actx);
-   // Causes H.264 to crash for some reason ...
-   //if (vctx)
-   //   avcodec_flush_buffers(vctx);
+   if (vctx)
+      avcodec_flush_buffers(vctx);
+   if (sctx)
+      avcodec_flush_buffers(sctx);
    if (ass_track)
       ass_flush_events(ass_track);
 }
@@ -802,35 +827,9 @@ static void decode_thread(void *data)
       }
       else if (pkt.stream_index == audio_stream)
       {
-         size_t decoded_size = 0;
          audio_buffer = decode_audio(&pkt, aud_frame,
                audio_buffer, &audio_buffer_cap,
-               &decoded_size,
                swr);
-
-         int64_t pts = av_frame_get_best_effort_timestamp(aud_frame);
-         //fprintf(stderr, "Got audio frame PTS: %.2f.\n", decode_last_audio_time);
-
-         slock_lock(fifo_lock);
-         while (!decode_thread_dead && fifo_write_avail(audio_decode_fifo) < decoded_size)
-         {
-            //fprintf(stderr, "Thread: Audio fifo is full ...\n");
-            if (!main_sleeping)
-               scond_wait(fifo_decode_cond, fifo_lock);
-            else
-            {
-               fprintf(stderr, "Thread: Audio deadlock detected ...\n");
-               fifo_clear(audio_decode_fifo);
-               break;
-            }
-         }
-
-         decode_last_audio_time = pts * av_q2d(fctx->streams[audio_stream]->time_base);
-         if (!decode_thread_dead)
-            fifo_write(audio_decode_fifo, audio_buffer, decoded_size);
-
-         scond_signal(fifo_cond);
-         slock_unlock(fifo_lock);
       }
       else if (pkt.stream_index == subtitle_stream)
       {
