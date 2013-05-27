@@ -643,7 +643,7 @@ static void decode_thread_seek(double time)
    decode_last_video_time = time;
    decode_last_audio_time = time;
 
-   int ret = av_seek_frame(fctx, stream, seek_to, flags);
+   int ret = avformat_seek_file(fctx, stream, INT64_MIN, seek_to, INT64_MAX, flags);
    if (ret < 0)
       fprintf(stderr, "av_seek_frame() failed.\n");
 
