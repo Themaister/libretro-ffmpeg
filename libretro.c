@@ -555,7 +555,6 @@ static bool decode_video(AVPacket *pkt, AVFrame *frame, AVFrame *conv, struct Sw
 static int16_t *decode_audio(AVPacket *pkt, AVFrame *frame, int16_t *buffer, size_t *buffer_cap,
       SwrContext *swr)
 {
-   avcodec_get_frame_defaults(frame);
    AVPacket pkt_tmp = *pkt;
 
    int got_ptr = 0;
@@ -563,6 +562,7 @@ static int16_t *decode_audio(AVPacket *pkt, AVFrame *frame, int16_t *buffer, siz
    for (;;)
    {
       int ret = 0;
+      avcodec_get_frame_defaults(frame);
       ret = avcodec_decode_audio4(actx, frame, &got_ptr, &pkt_tmp);
       if (ret < 0)
          return buffer;
