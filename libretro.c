@@ -1000,16 +1000,22 @@ error:
 
 void retro_unload_game(void)
 {
-   slock_lock(fifo_lock);
-   decode_thread_dead = true;
-   scond_signal(fifo_decode_cond);
-   slock_unlock(fifo_lock);
-   sthread_join(decode_thread_handle);
+   if (decode_thread_handle)
+   {
+      slock_lock(fifo_lock);
+      decode_thread_dead = true;
+      scond_signal(fifo_decode_cond);
+      slock_unlock(fifo_lock);
+      sthread_join(decode_thread_handle);
+   }
    decode_thread_handle = NULL;
 
-   scond_free(fifo_cond);
-   scond_free(fifo_decode_cond);
-   slock_free(fifo_lock);
+   if (fifo_cond)
+      scond_free(fifo_cond);
+   if (fifo_decode_cond)
+      scond_free(fifo_decode_cond);
+   if (fifo_lock)
+      slock_free(fifo_lock);
 
    if (video_decode_fifo)
       fifo_free(video_decode_fifo);
