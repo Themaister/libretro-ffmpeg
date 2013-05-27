@@ -726,11 +726,6 @@ static void decode_thread(void *data)
 
    while (!decode_thread_dead)
    {
-      AVPacket pkt;
-      memset(&pkt, 0, sizeof(pkt));
-      if (av_read_frame(fctx, &pkt) < 0)
-         break;
-
       slock_lock(fifo_lock);
       bool seek = do_seek;
       double seek_time_thread = seek_time;
@@ -752,6 +747,11 @@ static void decode_thread(void *data)
          scond_signal(fifo_cond);
          slock_unlock(fifo_lock);
       }
+
+      AVPacket pkt;
+      memset(&pkt, 0, sizeof(pkt));
+      if (av_read_frame(fctx, &pkt) < 0)
+         break;
 
       if (pkt.stream_index == video_stream)
       {
