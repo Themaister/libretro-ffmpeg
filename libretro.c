@@ -66,6 +66,7 @@ static uint32_t *video_frame_temp_buffer;
 #endif
 
 static bool main_sleeping;
+static bool temporal_interpolation;
 
 // Seeking.
 static bool do_seek;
@@ -180,6 +181,13 @@ static retro_input_state_t input_state_cb;
 void retro_set_environment(retro_environment_t cb)
 {
    environ_cb = cb;
+
+   static const struct retro_variable vars[] = {
+      { "ffmpeg_temporal_interp", "Temporal Interpolation; enabled|disabled" },
+      { NULL, NULL },
+   };
+
+   cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*)vars);
 }
 
 void retro_set_audio_sample(retro_audio_sample_t cb)
@@ -210,8 +218,27 @@ void retro_set_video_refresh(retro_video_refresh_t cb)
 void retro_reset(void)
 {}
 
+static void check_variables(void)
+{
+   struct retro_variable var = {
+      .key = "ffmpeg_temporal_interp"
+   };
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "enabled"))
+         temporal_interpolation = true;
+      else if (!strcmp(var.value, "disabled"))
+         temporal_interpolation = false;
+   }
+}
+
 void retro_run(void)
 {
+   bool updated = false;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
+      check_variables();
+
    input_poll_cb();
 
    int seek_frames = 0;
@@ -390,6 +417,8 @@ void retro_run(void)
       //fprintf(stderr, "Main: Found suitable frame.\n");
 
       float mix_factor = (min_pts - frames[0].pts) / (frames[1].pts - frames[0].pts);
+      if (!temporal_interpolation)
+         mix_factor = 1.0f;
 
       //fprintf(stderr, "Mix factor: %f, diff: %f\n", mix_factor, frames[1].pts - frames[0].pts);
 
@@ -990,6 +1019,7 @@ bool retro_load_game(const struct retro_game_info *info)
 #endif
 
    pts_bias = 0.0;
+   check_variables();
 
    return true;
 
