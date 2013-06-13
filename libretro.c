@@ -1133,9 +1133,7 @@ void retro_unload_game(void)
    ass_render = NULL;
    ass = NULL;
 
-#ifdef GLES
    av_freep(&video_frame_temp_buffer);
-#endif
 }
 
 unsigned retro_get_region(void)
