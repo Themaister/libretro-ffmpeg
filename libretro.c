@@ -489,7 +489,10 @@ static bool open_codec(AVCodecContext **ctx, unsigned index)
 {
    AVCodec *codec = avcodec_find_decoder(fctx->streams[index]->codec->codec_id);
    if (!codec)
+   {
+      fprintf(stderr, "Couldn't find suitable decoder, exiting...\n");
       return false;
+   }
 
    *ctx = fctx->streams[index]->codec;
    if (avcodec_open2(*ctx, codec, NULL) < 0)
@@ -568,8 +571,8 @@ static bool init_media_info(void)
    media.interpolate_fps = 60.0;
    if (vctx)
    {
-      //media.fps = 1.0 / (vctx->ticks_per_frame * av_q2d(vctx->time_base));
-      //fprintf(stderr, "FPS: %.3f\n", media.fps);
+      media.fps = 1.0 / (vctx->ticks_per_frame * av_q2d(vctx->time_base));
+      fprintf(stderr, "FPS: %.3f\n", media.fps);
       media.width  = vctx->width;
       media.height = vctx->height;
       media.aspect = (float)vctx->width * av_q2d(vctx->sample_aspect_ratio) / vctx->height;
