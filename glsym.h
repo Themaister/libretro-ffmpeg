@@ -1,6 +1,7 @@
 #ifndef GLSYM_H__
 #define GLSYM_H__
 
+#ifdef HAVE_GL
 #include "libretro.h"
 
 #define GL_GLEXT_PROTOTYPES
@@ -65,3 +66,4 @@ void glsym_init_procs(retro_hw_get_proc_address_t cb);
 
 #endif
 
+#endif

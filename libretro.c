@@ -13,10 +13,13 @@
 #include <libswscale/swscale.h>
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
+#include <libavdevice/avdevice.h>
 #include <libswresample/swresample.h>
 #include <ass/ass.h>
 
+#ifdef HAVE_GL
 #include "glsym.h"
+#endif
 
 #define LOG_ERR_GOTO(msg, label) do { \
    fprintf(stderr, "[FFmpeg]: " msg "\n"); goto label; \
@@ -61,9 +64,7 @@ static sthread_t *decode_thread_handle;
 static double decode_last_video_time;
 static double decode_last_audio_time;
 
-#ifdef GLES
 static uint32_t *video_frame_temp_buffer;
-#endif
 
 static bool main_sleeping;
 static bool temporal_interpolation;
@@ -73,23 +74,30 @@ static bool do_seek;
 static double seek_time;
 
 // GL stuff
+#if defined(HAVE_GL)
 static struct retro_hw_render_callback hw_render;
+#endif
+
 struct frame
 {
+#if defined(HAVE_GL)
    GLuint tex;
-#ifndef GLES
+#if !defined(GLES)
    GLuint pbo;
+#endif
 #endif
    double pts;
 };
 
 static struct frame frames[2];
 
+#ifdef HAVE_GL
 static GLuint prog;
 static GLuint vbo;
 static GLint vertex_loc;
 static GLint tex_loc;
 static GLint mix_loc;
+#endif
 
 ////
 
@@ -126,6 +134,7 @@ static void append_attachment(const uint8_t *data, size_t size)
 void retro_init(void)
 {
    av_register_all();
+   avdevice_register_all();
 }
 
 void retro_deinit(void)
@@ -148,7 +157,7 @@ void retro_get_system_info(struct retro_system_info *info)
    info->library_name     = "FFmpeg";
    info->library_version  = "v0";
    info->need_fullpath    = true;
-   info->valid_extensions = "mkv|avi|mp4|mp3|flac|ogg|m4a"; // Anything is fine, we don't care.
+   info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a";
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info)
@@ -182,12 +191,14 @@ void retro_set_environment(retro_environment_t cb)
 {
    environ_cb = cb;
 
+#ifdef HAVE_GL
    static const struct retro_variable vars[] = {
       { "ffmpeg_temporal_interp", "Temporal Interpolation; enabled|disabled" },
       { NULL, NULL },
    };
 
    cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*)vars);
+#endif
 }
 
 void retro_set_audio_sample(retro_audio_sample_t cb)
@@ -220,6 +231,7 @@ void retro_reset(void)
 
 static void check_variables(void)
 {
+#ifdef HAVE_GL
    struct retro_variable var = {
       .key = "ffmpeg_temporal_interp"
    };
@@ -231,6 +243,7 @@ static void check_variables(void)
       else if (!strcmp(var.value, "disabled"))
          temporal_interpolation = false;
    }
+#endif
 }
 
 void retro_run(void)
@@ -358,6 +371,9 @@ void retro_run(void)
    double min_pts = frame_cnt / media.interpolate_fps + pts_bias;
    if (video_stream >= 0)
    {
+#ifndef HAVE_GL
+      bool dupe = true;
+#endif
       // Video
       if (min_pts > frames[1].pts)
       {
@@ -385,8 +401,8 @@ void retro_run(void)
          if (!decode_thread_dead)
          {
             fifo_read(video_decode_fifo, &pts, sizeof(int64_t));
-
-#ifdef GLES
+#if defined(HAVE_GL)
+#if defined(GLES)
             fifo_read(video_decode_fifo, video_frame_temp_buffer, media.width * media.height * sizeof(uint32_t));
             glBindTexture(GL_TEXTURE_2D, frames[1].tex);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
@@ -406,6 +422,10 @@ void retro_run(void)
             glBindTexture(GL_TEXTURE_2D, 0);
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 #endif
+#else
+            fifo_read(video_decode_fifo, video_frame_temp_buffer, media.width * media.height * sizeof(uint32_t));
+            dupe = false;
+#endif
          }
 
          scond_signal(fifo_decode_cond);
@@ -422,6 +442,7 @@ void retro_run(void)
 
       //fprintf(stderr, "Mix factor: %f, diff: %f\n", mix_factor, frames[1].pts - frames[0].pts);
 
+#ifdef HAVE_GL
       glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
       glClearColor(0, 0, 0, 1);
       glClear(GL_COLOR_BUFFER_BIT);
@@ -455,6 +476,9 @@ void retro_run(void)
       glBindTexture(GL_TEXTURE_2D, 0);
 
       video_cb(RETRO_HW_FRAME_BUFFER_VALID, media.width, media.height, media.width * sizeof(uint32_t));
+#else
+      video_cb(dupe ? NULL : video_frame_temp_buffer, media.width, media.height, media.width * sizeof(uint32_t));
+#endif
    }
    else
       video_cb(NULL, 1, 1, sizeof(uint32_t));
@@ -467,7 +491,10 @@ static bool open_codec(AVCodecContext **ctx, unsigned index)
 {
    AVCodec *codec = avcodec_find_decoder(fctx->streams[index]->codec->codec_id);
    if (!codec)
+   {
+      fprintf(stderr, "Couldn't find suitable decoder, exiting...\n");
       return false;
+   }
 
    *ctx = fctx->streams[index]->codec;
    if (avcodec_open2(*ctx, codec, NULL) < 0)
@@ -546,8 +573,8 @@ static bool init_media_info(void)
    media.interpolate_fps = 60.0;
    if (vctx)
    {
-      //media.fps = 1.0 / (vctx->ticks_per_frame * av_q2d(vctx->time_base));
-      //fprintf(stderr, "FPS: %.3f\n", media.fps);
+      media.fps = 1.0 / (vctx->ticks_per_frame * av_q2d(vctx->time_base));
+      fprintf(stderr, "FPS: %.3f\n", media.fps);
       media.width  = vctx->width;
       media.height = vctx->height;
       media.aspect = (float)vctx->width * av_q2d(vctx->sample_aspect_ratio) / vctx->height;
@@ -892,6 +919,7 @@ static void decode_thread(void *data)
    slock_unlock(fifo_lock);
 }
 
+#ifdef HAVE_GL
 static void context_reset(void)
 {
    glsym_init_procs(hw_render.get_proc_address);
@@ -971,6 +999,7 @@ static void context_reset(void)
    glBindBuffer(GL_ARRAY_BUFFER, 0);
    glBindTexture(GL_TEXTURE_2D, 0);
 }
+#endif
 
 bool retro_load_game(const struct retro_game_info *info)
 {
@@ -996,6 +1025,7 @@ bool retro_load_game(const struct retro_game_info *info)
    {
       video_decode_fifo = fifo_new(media.width * media.height * sizeof(uint32_t) * 32);
 
+#ifdef HAVE_GL
       hw_render.context_reset = context_reset;
 #ifdef GLES
       hw_render.context_type = RETRO_HW_CONTEXT_OPENGLES2;
@@ -1004,6 +1034,7 @@ bool retro_load_game(const struct retro_game_info *info)
 #endif
       if (!environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))
          LOG_ERR_GOTO("Cannot initialize HW render.", error);
+#endif
    }
    if (audio_stream >= 0)
       audio_decode_fifo = fifo_new(20 * media.sample_rate * sizeof(int16_t) * 2);
@@ -1014,9 +1045,7 @@ bool retro_load_game(const struct retro_game_info *info)
 
    decode_thread_handle = sthread_create(decode_thread, NULL);
 
-#ifdef GLES
    video_frame_temp_buffer = av_malloc(media.width * media.height * sizeof(uint32_t));
-#endif
 
    pts_bias = 0.0;
    check_variables();
@@ -1109,9 +1138,7 @@ void retro_unload_game(void)
    ass_render = NULL;
    ass = NULL;
 
-#ifdef GLES
    av_freep(&video_frame_temp_buffer);
-#endif
 }
 
 unsigned retro_get_region(void)
