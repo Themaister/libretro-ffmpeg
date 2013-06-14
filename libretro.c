@@ -13,6 +13,7 @@
 #include <libswscale/swscale.h>
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
+#include <libavdevice/avdevice.h>
 #include <libswresample/swresample.h>
 #include <ass/ass.h>
 
@@ -133,6 +134,7 @@ static void append_attachment(const uint8_t *data, size_t size)
 void retro_init(void)
 {
    av_register_all();
+   avdevice_register_all();
 }
 
 void retro_deinit(void)

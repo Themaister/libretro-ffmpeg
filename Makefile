@@ -19,45 +19,45 @@ ifeq ($(platform), unix)
    SHARED := -shared -Wl,--version-script=link.T -Wl,--no-undefined -fPIC
    GL_LIB := -lGL
 
-   LIBS = $(shell pkg-config libavcodec libavformat libavutil libswscale libswresample libass --libs) -pthread
-   CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libswscale libswresample libass --cflags) -pthread
+   LIBS = $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --libs) -pthread
+   CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --cflags) -pthread
 	CFLAGS += -DHAVE_GL
 else ifeq ($(platform), unix-sw)
    TARGET := $(TARGET_NAME)_sw_libretro.so
    fpic := -fPIC
    SHARED := -shared -Wl,--version-script=link.T -Wl,--no-undefined -fPIC
 
-   LIBS = $(shell pkg-config libavcodec libavformat libavutil libswscale libswresample libass --libs) -pthread
-   CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libswscale libswresample libass --cflags) -pthread
+   LIBS = $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --libs) -pthread
+   CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --cflags) -pthread
 else ifeq ($(platform), osx)
    TARGET := $(TARGET_NAME)_sw_libretro.dylib
    fpic := -fPIC
    SHARED := -dynamiclib
    GL_LIB := -framework OpenGL
 
-   LIBS = $(shell pkg-config libavcodec libavformat libavutil libswscale libswresample libass --libs) -pthread
-   CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libswscale libswresample libass --cflags) -pthread
+   LIBS = $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --libs) -pthread
+   CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --cflags) -pthread
 	CFLAGS += -DHAVE_GL
 else ifeq ($(platform), osx-sw)
    TARGET := $(TARGET_NAME)_libretro.dylib
    fpic := -fPIC
    SHARED := -dynamiclib
 
-   LIBS = $(shell pkg-config libavcodec libavformat libavutil libswscale libswresample libass --libs) -pthread
-   CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libswscale libswresample libass --cflags) -pthread
+   LIBS = $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --libs) -pthread
+   CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --cflags) -pthread
 else ifeq ($(platform), win-sw)
    CC = gcc
    TARGET := $(TARGET_NAME)_retro.dll
    SHARED := -shared -static-libgcc -static-libstdc++ -s -Wl,--version-script=link.T -Wl,--no-undefined
    CFLAGS += -Iffmpeg
-   LIBS += -L. -lavcodec -lavformat -lavutil -lswscale -lswresample -lass
+   LIBS += -L. -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample -lass
 else
    CC = gcc
    TARGET := $(TARGET_NAME)_retro.dll
    SHARED := -shared -static-libgcc -static-libstdc++ -s -Wl,--version-script=link.T -Wl,--no-undefined
    GL_LIB := -lopengl32
    CFLAGS += -Iffmpeg
-   LIBS += -L. -lavcodec -lavformat -lavutil -lswscale -lswresample -lass
+   LIBS += -L. -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample -lass
 	CFLAGS += -DHAVE_GL
 endif
 
