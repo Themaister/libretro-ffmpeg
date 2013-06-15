@@ -67,17 +67,12 @@ static double decode_last_audio_time;
 static uint32_t *video_frame_temp_buffer;
 
 static bool main_sleeping;
-static bool temporal_interpolation;
 
 // Seeking.
 static bool do_seek;
 static double seek_time;
 
 // GL stuff
-#if defined(HAVE_GL)
-static struct retro_hw_render_callback hw_render;
-#endif
-
 struct frame
 {
 #if defined(HAVE_GL)
@@ -92,6 +87,8 @@ struct frame
 static struct frame frames[2];
 
 #ifdef HAVE_GL
+static bool temporal_interpolation;
+static struct retro_hw_render_callback hw_render;
 static GLuint prog;
 static GLuint vbo;
 static GLint vertex_loc;
@@ -106,7 +103,6 @@ static struct
    unsigned width;
    unsigned height;
 
-   double fps;
    double interpolate_fps;
    unsigned sample_rate;
 
@@ -434,15 +430,11 @@ void retro_run(void)
          frames[1].pts = av_q2d(fctx->streams[video_stream]->time_base) * pts;
       }
 
-      //fprintf(stderr, "Main: Found suitable frame.\n");
-
+#ifdef HAVE_GL
       float mix_factor = (min_pts - frames[0].pts) / (frames[1].pts - frames[0].pts);
       if (!temporal_interpolation)
          mix_factor = 1.0f;
 
-      //fprintf(stderr, "Mix factor: %f, diff: %f\n", mix_factor, frames[1].pts - frames[0].pts);
-
-#ifdef HAVE_GL
       glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
       glClearColor(0, 0, 0, 1);
       glClear(GL_COLOR_BUFFER_BIT);
@@ -492,7 +484,7 @@ static bool open_codec(AVCodecContext **ctx, unsigned index)
    AVCodec *codec = avcodec_find_decoder(fctx->streams[index]->codec->codec_id);
    if (!codec)
    {
-      fprintf(stderr, "Couldn't find suitable decoder, exiting...\n");
+      fprintf(stderr, "Couldn't find suitable decoder, exiting ... \n");
       return false;
    }
 
@@ -573,8 +565,6 @@ static bool init_media_info(void)
    media.interpolate_fps = 60.0;
    if (vctx)
    {
-      media.fps = 1.0 / (vctx->ticks_per_frame * av_q2d(vctx->time_base));
-      fprintf(stderr, "FPS: %.3f\n", media.fps);
       media.width  = vctx->width;
       media.height = vctx->height;
       media.aspect = (float)vctx->width * av_q2d(vctx->sample_aspect_ratio) / vctx->height;

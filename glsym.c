@@ -75,3 +75,4 @@ void glsym_init_procs(retro_hw_get_proc_address_t cb)
 #endif
 
 #endif
+
