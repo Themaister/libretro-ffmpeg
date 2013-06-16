@@ -328,6 +328,10 @@ void retro_run(void)
       do_seek = true;
       seek_time = frame_cnt / media.interpolate_fps;
 
+      char msg[256];
+      snprintf(msg, sizeof(msg), "Seek: %u s.", (unsigned)seek_time);
+      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &(struct retro_message) { .msg = msg, .frames = 180 });
+
       if (seek_frames < 0)
       {
          fprintf(stderr, "Resetting PTS.\n");
