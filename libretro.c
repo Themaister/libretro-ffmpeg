@@ -28,18 +28,24 @@
 // FFmpeg context data.
 static AVFormatContext *fctx;
 static AVCodecContext *vctx;
-static AVCodecContext *actx;
-static AVCodecContext *sctx;
 static int video_stream;
-static int audio_stream;
-static int subtitle_stream;
+
+#define MAX_STREAMS 8
+static AVCodecContext *actx[MAX_STREAMS];
+static AVCodecContext *sctx[MAX_STREAMS];
+static int audio_streams[MAX_STREAMS];
+static int audio_streams_num;
+static int audio_streams_ptr;
+static int subtitle_streams[MAX_STREAMS];
+static int subtitle_streams_num;
+static int subtitle_streams_ptr;
 
 // AAS/SSA subtitles.
 static ASS_Library *ass;
 static ASS_Renderer *ass_render;
-static ASS_Track *ass_track;
-static uint8_t *ass_extra_data;
-static size_t ass_extra_data_size;
+static ASS_Track *ass_track[MAX_STREAMS];
+static uint8_t *ass_extra_data[MAX_STREAMS];
+static size_t ass_extra_data_size[MAX_STREAMS];
 struct attachment
 {
    uint8_t *data;
@@ -60,6 +66,7 @@ static fifo_buffer_t *audio_decode_fifo;
 static scond_t *fifo_cond;
 static scond_t *fifo_decode_cond;
 static slock_t *fifo_lock;
+static slock_t *decode_thread_lock;
 static sthread_t *decode_thread_handle;
 static double decode_last_video_time;
 static double decode_last_audio_time;
@@ -151,7 +158,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "FFmpeg";
-   info->library_version  = "v0";
+   info->library_version  = "v1";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a";
 }
@@ -160,7 +167,7 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
 {
    info->timing = (struct retro_system_timing) {
       .fps = media.interpolate_fps,
-      .sample_rate = actx ? media.sample_rate : 32000.0,
+      .sample_rate = actx[0] ? media.sample_rate : 32000.0,
    };
 
    unsigned width  = vctx ? media.width : 320;
@@ -255,6 +262,8 @@ void retro_run(void)
    static bool last_right;
    static bool last_up;
    static bool last_down;
+   static bool last_l;
+   static bool last_r;
    bool left = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0,
          RETRO_DEVICE_ID_JOYPAD_LEFT);
    bool right = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0,
@@ -263,6 +272,10 @@ void retro_run(void)
          RETRO_DEVICE_ID_JOYPAD_UP);
    bool down = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0,
          RETRO_DEVICE_ID_JOYPAD_DOWN);
+   bool l = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0,
+         RETRO_DEVICE_ID_JOYPAD_L);
+   bool r = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0,
+         RETRO_DEVICE_ID_JOYPAD_R);
 
    if (left && !last_left)
       seek_frames -= 10 * media.interpolate_fps;
@@ -273,10 +286,33 @@ void retro_run(void)
    if (down && !last_down)
       seek_frames -= 60 * media.interpolate_fps;
 
+   if (l && !last_l && audio_streams_num > 0)
+   {
+      slock_lock(decode_thread_lock);
+      audio_streams_ptr = (audio_streams_ptr + 1) % audio_streams_num;
+      slock_unlock(decode_thread_lock);
+
+      char msg[256];
+      snprintf(msg, sizeof(msg), "Audio Track #%d.", audio_streams_ptr);
+      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &(struct retro_message) { .msg = msg, .frames = 180 });
+   }
+   else if (r && !last_r && subtitle_streams_num > 0)
+   {
+      slock_lock(decode_thread_lock);
+      subtitle_streams_ptr = (subtitle_streams_ptr + 1) % subtitle_streams_num;
+      slock_unlock(decode_thread_lock);
+
+      char msg[256];
+      snprintf(msg, sizeof(msg), "Subtitle Track #%d.", subtitle_streams_ptr);
+      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &(struct retro_message) { .msg = msg, .frames = 180 });
+   }
+
    last_left = left;
    last_right = right;
    last_up = up;
    last_down = down;
+   last_l = l;
+   last_r = r;
 
    // Push seek request to thread,
    // wait for seek to complete.
@@ -324,7 +360,7 @@ void retro_run(void)
 
    // Have to decode audio before video incase there are PTS fuckups due
    // to seeking.
-   if (audio_stream >= 0)
+   if (audio_streams_num > 0)
    {
       // Audio
       uint64_t expected_audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
@@ -334,7 +370,6 @@ void retro_run(void)
       slock_lock(fifo_lock);
       while (!decode_thread_dead && fifo_read_avail(audio_decode_fifo) < to_read_bytes)
       {
-         //fprintf(stderr, "Main: Audio fifo is empty.\n");
          main_sleeping = true;
          scond_signal(fifo_decode_cond);
          scond_wait(fifo_cond, fifo_lock);
@@ -353,7 +388,6 @@ void retro_run(void)
          fprintf(stderr, "Resetting PTS (bias).\n");
          frames[0].pts = 0.0;
          frames[1].pts = 0.0;
-         //fprintf(stderr, "Expect delay: %.2f s.\n", old_pts_bias - pts_bias);
       }
 
       if (!decode_thread_dead)
@@ -384,14 +418,11 @@ void retro_run(void)
          size_t to_read_frame_bytes = media.width * media.height * sizeof(uint32_t) + sizeof(int64_t);
          while (!decode_thread_dead && fifo_read_avail(video_decode_fifo) < to_read_frame_bytes)
          {
-            //fprintf(stderr, "Main: Video fifo is empty.\n");
             main_sleeping = true;
             scond_signal(fifo_decode_cond);
             scond_wait(fifo_cond, fifo_lock);
             main_sleeping = false;
          }
-
-         //fprintf(stderr, "Main: Reading video frame.\n");
 
          int64_t pts = 0;
          if (!decode_thread_dead)
@@ -498,19 +529,24 @@ static bool open_codec(AVCodecContext **ctx, unsigned index)
 static bool open_codecs(void)
 {
    video_stream = -1;
-   audio_stream = -1;
-   subtitle_stream = -1;
+   memset(audio_streams, 0, sizeof(audio_streams));
+   memset(subtitle_streams, 0, sizeof(subtitle_streams));
+   audio_streams_num = 0;
+   audio_streams_ptr = 0;
+   subtitle_streams_num = 0;
+   subtitle_streams_ptr = 0;
 
    for (unsigned i = 0; i < fctx->nb_streams; i++)
    {
       switch (fctx->streams[i]->codec->codec_type)
       {
          case AVMEDIA_TYPE_AUDIO:
-            if (!actx)
+            if (audio_streams_num < MAX_STREAMS)
             {
-               if (!open_codec(&actx, i))
+               if (!open_codec(&actx[audio_streams_num], i))
                   return false;
-               audio_stream = i;
+               audio_streams[audio_streams_num] = i;
+               audio_streams_num++;
             }
             break;
 
@@ -524,20 +560,23 @@ static bool open_codecs(void)
             break;
 
          case AVMEDIA_TYPE_SUBTITLE:
-            if (!sctx && fctx->streams[i]->codec->codec_id == CODEC_ID_SSA)
+            if (subtitle_streams_num < MAX_STREAMS && fctx->streams[i]->codec->codec_id == CODEC_ID_SSA)
             {
-               if (!open_codec(&sctx, i))
+               AVCodecContext **s = &sctx[subtitle_streams_num];
+               subtitle_streams[subtitle_streams_num] = i;
+               if (!open_codec(s, i))
                   return false;
-               subtitle_stream = i;
 
-               ass_extra_data_size = sctx->extradata ? sctx->extradata_size : 0;
+               int size = (*s)->extradata ? (*s)->extradata_size : 0;
+               ass_extra_data_size[subtitle_streams_num] = size;
 
-               if (ass_extra_data_size)
+               if (size)
                {
-                  ass_extra_data = av_malloc(ass_extra_data_size);
-                  memcpy(ass_extra_data, sctx->extradata,
-                        ass_extra_data_size);
+                  ass_extra_data[subtitle_streams_num] = av_malloc(size);
+                  memcpy(ass_extra_data[subtitle_streams_num], (*s)->extradata, size);
                }
+
+               subtitle_streams_num++;
             }
             break;
 
@@ -554,13 +593,13 @@ static bool open_codecs(void)
       }
    }
 
-   return actx || vctx;
+   return actx[0] || vctx;
 }
 
 static bool init_media_info(void)
 {
-   if (actx)
-      media.sample_rate = actx->sample_rate;
+   if (actx[0])
+      media.sample_rate = actx[0]->sample_rate;
 
    media.interpolate_fps = 60.0;
    if (vctx)
@@ -570,7 +609,7 @@ static bool init_media_info(void)
       media.aspect = (float)vctx->width * av_q2d(vctx->sample_aspect_ratio) / vctx->height;
    }
 
-   if (sctx)
+   if (sctx[0])
    {
       ass = ass_library_init();
       ass_set_message_cb(ass, ass_msg_cb, NULL);
@@ -583,9 +622,12 @@ static bool init_media_info(void)
       ass_set_fonts(ass_render, NULL, NULL, 1, NULL, 1);
       ass_set_hinting(ass_render, ASS_HINTING_LIGHT);
 
-      ass_track = ass_new_track(ass);
-      ass_process_codec_private(ass_track, (char*)ass_extra_data,
-            ass_extra_data_size);
+      for (int i = 0; i < subtitle_streams_num; i++)
+      {
+         ass_track[i] = ass_new_track(ass);
+         ass_process_codec_private(ass_track[i], (char*)ass_extra_data[i],
+               ass_extra_data_size[i]);
+      }
    }
 
    return true;
@@ -609,7 +651,7 @@ static bool decode_video(AVPacket *pkt, AVFrame *frame, AVFrame *conv, struct Sw
       return false;
 }
 
-static int16_t *decode_audio(AVPacket *pkt, AVFrame *frame, int16_t *buffer, size_t *buffer_cap,
+static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt, AVFrame *frame, int16_t *buffer, size_t *buffer_cap,
       SwrContext *swr)
 {
    AVPacket pkt_tmp = *pkt;
@@ -620,7 +662,7 @@ static int16_t *decode_audio(AVPacket *pkt, AVFrame *frame, int16_t *buffer, siz
    {
       int ret = 0;
       avcodec_get_frame_defaults(frame);
-      ret = avcodec_decode_audio4(actx, frame, &got_ptr, &pkt_tmp);
+      ret = avcodec_decode_audio4(ctx, frame, &got_ptr, &pkt_tmp);
       if (ret < 0)
          return buffer;
 
@@ -648,7 +690,6 @@ static int16_t *decode_audio(AVPacket *pkt, AVFrame *frame, int16_t *buffer, siz
       slock_lock(fifo_lock);
       while (!decode_thread_dead && fifo_write_avail(audio_decode_fifo) < required_buffer)
       {
-         //fprintf(stderr, "Thread: Audio fifo is full ...\n");
          if (!main_sleeping)
             scond_wait(fifo_decode_cond, fifo_lock);
          else
@@ -659,7 +700,7 @@ static int16_t *decode_audio(AVPacket *pkt, AVFrame *frame, int16_t *buffer, siz
          }
       }
 
-      decode_last_audio_time = pts * av_q2d(fctx->streams[audio_stream]->time_base);
+      decode_last_audio_time = pts * av_q2d(fctx->streams[audio_streams[audio_streams_ptr]]->time_base);
       if (!decode_thread_dead)
          fifo_write(audio_decode_fifo, buffer, required_buffer);
 
@@ -683,14 +724,14 @@ static void decode_thread_seek(double time)
    if (ret < 0)
       fprintf(stderr, "av_seek_frame() failed.\n");
 
-   if (actx)
-      avcodec_flush_buffers(actx);
+   if (actx[audio_streams_ptr])
+      avcodec_flush_buffers(actx[audio_streams_ptr]);
    if (vctx)
       avcodec_flush_buffers(vctx);
-   if (sctx)
-      avcodec_flush_buffers(sctx);
-   if (ass_track)
-      ass_flush_events(ass_track);
+   if (sctx[subtitle_streams_ptr])
+      avcodec_flush_buffers(sctx[subtitle_streams_ptr]);
+   if (ass_track[subtitle_streams_ptr])
+      ass_flush_events(ass_track[subtitle_streams_ptr]);
 }
 
 // Straight CPU alpha blending.
@@ -751,13 +792,13 @@ static void decode_thread(void *data)
 
    SwrContext *swr = swr_alloc();
 
-   if (audio_stream >= 0)
+   if (audio_streams_num > 0)
    {
-      av_opt_set_int(swr, "in_channel_layout", actx->channel_layout, 0);
+      av_opt_set_int(swr, "in_channel_layout", actx[0]->channel_layout, 0);
       av_opt_set_int(swr, "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
       av_opt_set_int(swr, "in_sample_rate", media.sample_rate, 0);
       av_opt_set_int(swr, "out_sample_rate", media.sample_rate, 0);
-      av_opt_set_int(swr, "in_sample_fmt", actx->sample_fmt, 0);
+      av_opt_set_int(swr, "in_sample_fmt", actx[0]->sample_fmt, 0);
       av_opt_set_int(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
       swr_init(swr);
    }
@@ -810,21 +851,27 @@ static void decode_thread(void *data)
       if (av_read_frame(fctx, &pkt) < 0)
          break;
 
+      slock_lock(decode_thread_lock);
+      int audio_stream = audio_streams[audio_streams_ptr];
+      int subtitle_stream = subtitle_streams[subtitle_streams_ptr];
+      AVCodecContext *actx_active = actx[audio_streams_ptr];
+      AVCodecContext *sctx_active = sctx[subtitle_streams_ptr];
+      ASS_Track *ass_track_active = ass_track[subtitle_streams_ptr];
+      slock_unlock(decode_thread_lock);
+
       if (pkt.stream_index == video_stream)
       {
          if (decode_video(&pkt, vid_frame, conv_frame, sws))
          {
             int64_t pts = av_frame_get_best_effort_timestamp(vid_frame);
-            //fprintf(stderr, "Got video frame PTS: %.2f.\n", decode_last_video_time);
 
             double video_time = pts * av_q2d(fctx->streams[video_stream]->time_base);
             if (ass_render)
             {
                int change = 0;
-               ASS_Image *img = ass_render_frame(ass_render, ass_track,
+               ASS_Image *img = ass_render_frame(ass_render, ass_track_active,
                      1000 * video_time, &change);
 
-               //fprintf(stderr, "Rendering ASS image: %p.\n", (void*)img);
                // Do it on CPU for now.
                // We're in a thread anyways, so shouldn't really matter.
                render_ass_img(conv_frame, img);
@@ -834,12 +881,10 @@ static void decode_thread(void *data)
             slock_lock(fifo_lock);
             while (!decode_thread_dead && fifo_write_avail(video_decode_fifo) < decoded_size)
             {
-               //fprintf(stderr, "Thread: Video fifo is full ...\n");
                if (!main_sleeping)
                   scond_wait(fifo_decode_cond, fifo_lock);
                else
                {
-                  //fprintf(stderr, "Thread: Video deadlock detected ...\n");
                   fifo_clear(video_decode_fifo);
                   break;
                }
@@ -853,9 +898,6 @@ static void decode_thread(void *data)
                int stride = conv_frame->linesize[0];
                for (unsigned y = 0; y < media.height; y++, src += stride)
                   fifo_write(video_decode_fifo, src, media.width * sizeof(uint32_t));
-
-               //fprintf(stderr, "Wrote frame, frames: #%zu\n", fifo_read_avail(video_decode_fifo) /
-               //      decoded_size);
             }
             scond_signal(fifo_cond);
             slock_unlock(fifo_lock);
@@ -863,7 +905,7 @@ static void decode_thread(void *data)
       }
       else if (pkt.stream_index == audio_stream)
       {
-         audio_buffer = decode_audio(&pkt, aud_frame,
+         audio_buffer = decode_audio(actx_active, &pkt, aud_frame,
                audio_buffer, &audio_buffer_cap,
                swr);
       }
@@ -875,7 +917,7 @@ static void decode_thread(void *data)
          int finished = 0;
          while (!finished)
          {
-            if (avcodec_decode_subtitle2(sctx, &sub, &finished, &pkt) < 0)
+            if (avcodec_decode_subtitle2(sctx_active, &sub, &finished, &pkt) < 0)
             {
                fprintf(stderr, "Decode subtitles failed.\n");
                break;
@@ -885,7 +927,7 @@ static void decode_thread(void *data)
          for (int i = 0; i < sub.num_rects; i++)
          {
             if (sub.rects[i]->ass)
-               ass_process_data(ass_track, sub.rects[i]->ass, strlen(sub.rects[i]->ass));
+               ass_process_data(ass_track_active, sub.rects[i]->ass, strlen(sub.rects[i]->ass));
          }
 
          avsubtitle_free(&sub);
@@ -896,6 +938,7 @@ static void decode_thread(void *data)
 
    if (sws)
       sws_freeContext(sws);
+   sws = NULL;
    swr_free(&swr);
    av_freep(&aud_frame);
    av_freep(&vid_frame);
@@ -1026,12 +1069,13 @@ bool retro_load_game(const struct retro_game_info *info)
          LOG_ERR_GOTO("Cannot initialize HW render.", error);
 #endif
    }
-   if (audio_stream >= 0)
+   if (audio_streams_num > 0)
       audio_decode_fifo = fifo_new(20 * media.sample_rate * sizeof(int16_t) * 2);
 
    fifo_cond = scond_new();
    fifo_decode_cond = scond_new();
    fifo_lock = slock_new();
+   decode_thread_lock = slock_new();
 
    decode_thread_handle = sthread_create(decode_thread, NULL);
 
@@ -1065,6 +1109,8 @@ void retro_unload_game(void)
       scond_free(fifo_decode_cond);
    if (fifo_lock)
       slock_free(fifo_lock);
+   if (decode_thread_lock)
+      slock_free(decode_thread_lock);
 
    if (video_decode_fifo)
       fifo_free(video_decode_fifo);
@@ -1074,6 +1120,7 @@ void retro_unload_game(void)
    fifo_cond = NULL;
    fifo_decode_cond = NULL;
    fifo_lock = NULL;
+   decode_thread_lock = NULL;
    video_decode_fifo = NULL;
    audio_decode_fifo = NULL;
 
@@ -1085,16 +1132,14 @@ void retro_unload_game(void)
    frame_cnt = 0;
    audio_frames = 0;
 
-   if (sctx)
+   for (unsigned i = 0; i < MAX_STREAMS; i++)
    {
-      avcodec_close(sctx);
-      sctx = NULL;
-   }
-
-   if (actx)
-   {
-      avcodec_close(actx);
-      actx = NULL;
+      if (sctx[i])
+         avcodec_close(sctx[i]);
+      if (actx[i])
+         avcodec_close(actx[i]);
+      sctx[i] = NULL;
+      actx[i] = NULL;
    }
 
    if (vctx)
@@ -1109,22 +1154,25 @@ void retro_unload_game(void)
       fctx = NULL;
    }
 
-   av_freep(&ass_extra_data);
-   ass_extra_data_size = 0;
-
    for (size_t i = 0; i < attachments_size; i++)
       av_freep(&attachments[i].data);
    av_freep(&attachments);
    attachments_size = 0;
 
-   if (ass_track)
-      ass_free_track(ass_track);
+   for (unsigned i = 0; i < MAX_STREAMS; i++)
+   {
+      if (ass_track[i])
+         ass_free_track(ass_track[i]);
+      ass_track[i] = NULL;
+
+      av_freep(&ass_extra_data[i]);
+      ass_extra_data_size[i] = 0;
+   }
    if (ass_render)
       ass_renderer_done(ass_render);
    if (ass)
       ass_library_done(ass);
 
-   ass_track = NULL;
    ass_render = NULL;
    ass = NULL;
 
