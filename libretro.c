@@ -137,7 +137,7 @@ static void append_attachment(const uint8_t *data, size_t size)
 void retro_init(void)
 {
    av_register_all();
-   avdevice_register_all();
+   //avdevice_register_all(); // FIXME: Occasionally crashes inside libavdevice for some odd reason on reentrancy. Likely a libavdevice bug.
 }
 
 void retro_deinit(void)
