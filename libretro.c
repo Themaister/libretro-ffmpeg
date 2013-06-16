@@ -1050,6 +1050,8 @@ bool retro_load_game(const struct retro_game_info *info)
    if (avformat_find_stream_info(fctx, NULL) < 0)
       LOG_ERR_GOTO("Failed to find stream info.", error);
 
+   av_dump_format(fctx, 0, info->path, 0);
+
    if (!open_codecs())
       LOG_ERR_GOTO("Failed to find codec.", error);
 
