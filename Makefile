@@ -18,6 +18,7 @@ ifeq ($(platform), unix)
    fpic := -fPIC
    SHARED := -shared -Wl,--version-script=link.T -Wl,--no-undefined -fPIC
    GL_LIB := -lGL
+   HAVE_SSA := 1
 
    LIBS = $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --libs) -pthread
    CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --cflags) -pthread
@@ -26,6 +27,7 @@ else ifeq ($(platform), unix-sw)
    TARGET := $(TARGET_NAME)_sw_libretro.so
    fpic := -fPIC
    SHARED := -shared -Wl,--version-script=link.T -Wl,--no-undefined -fPIC
+   HAVE_SSA := 1
 
    LIBS = $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --libs) -pthread
    CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --cflags) -pthread
@@ -34,6 +36,7 @@ else ifeq ($(platform), osx)
    fpic := -fPIC
    SHARED := -dynamiclib
    GL_LIB := -framework OpenGL
+   HAVE_SSA := 1
 
    LIBS = $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --libs) -pthread
    CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --cflags) -pthread
@@ -42,6 +45,7 @@ else ifeq ($(platform), osx-sw)
    TARGET := $(TARGET_NAME)_sw_libretro.dylib
    fpic := -fPIC
    SHARED := -dynamiclib
+   HAVE_SSA := 1
 
    LIBS = $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --libs) -pthread
    CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --cflags) -pthread
@@ -59,6 +63,11 @@ else
    CFLAGS += -Iffmpeg
    LIBS += -L. -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample -lass
    CFLAGS += -DHAVE_GL
+endif
+
+ifeq ($(HAVE_SSA), 1)
+   LIBS += $(shell pkg-config libass --libs)
+   CFLAGS += -DHAVE_SSA
 endif
 
 SOURCE := $(wildcard *.c)

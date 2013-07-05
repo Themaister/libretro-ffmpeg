@@ -15,7 +15,9 @@
 #include <libavutil/opt.h>
 #include <libavdevice/avdevice.h>
 #include <libswresample/swresample.h>
+#ifdef HAVE_SSA
 #include <ass/ass.h>
+#endif
 
 #ifdef HAVE_GL
 #include "glsym.h"
@@ -41,11 +43,14 @@ static int subtitle_streams_num;
 static int subtitle_streams_ptr;
 
 // AAS/SSA subtitles.
+#ifdef HAVE_SSA
 static ASS_Library *ass;
 static ASS_Renderer *ass_render;
 static ASS_Track *ass_track[MAX_STREAMS];
 static uint8_t *ass_extra_data[MAX_STREAMS];
 static size_t ass_extra_data_size[MAX_STREAMS];
+#endif
+
 struct attachment
 {
    uint8_t *data;
@@ -116,12 +121,14 @@ static struct
    float aspect;
 } media;
 
+#ifdef HAVE_SSA
 static void ass_msg_cb(int level, const char *fmt, va_list args, void *data)
 {
    (void)data;
    if (level < 6)
       vfprintf(stderr, fmt, args);
 }
+#endif
 
 static void append_attachment(const uint8_t *data, size_t size)
 {
@@ -564,6 +571,7 @@ static bool open_codecs(void)
             break;
 
          case AVMEDIA_TYPE_SUBTITLE:
+#ifdef HAVE_SSA
             if (subtitle_streams_num < MAX_STREAMS && fctx->streams[i]->codec->codec_id == CODEC_ID_SSA)
             {
                AVCodecContext **s = &sctx[subtitle_streams_num];
@@ -582,6 +590,7 @@ static bool open_codecs(void)
 
                subtitle_streams_num++;
             }
+#endif
             break;
 
          case AVMEDIA_TYPE_ATTACHMENT:
@@ -613,6 +622,7 @@ static bool init_media_info(void)
       media.aspect = (float)vctx->width * av_q2d(vctx->sample_aspect_ratio) / vctx->height;
    }
 
+#ifdef HAVE_SSA
    if (sctx[0])
    {
       ass = ass_library_init();
@@ -633,6 +643,7 @@ static bool init_media_info(void)
                ass_extra_data_size[i]);
       }
    }
+#endif
 
    return true;
 }
@@ -734,10 +745,13 @@ static void decode_thread_seek(double time)
       avcodec_flush_buffers(vctx);
    if (sctx[subtitle_streams_ptr])
       avcodec_flush_buffers(sctx[subtitle_streams_ptr]);
+#ifdef HAVE_SSA
    if (ass_track[subtitle_streams_ptr])
       ass_flush_events(ass_track[subtitle_streams_ptr]);
+#endif
 }
 
+#ifdef HAVE_SSA
 // Straight CPU alpha blending.
 // Should probably do in GL.
 static void render_ass_img(AVFrame *conv_frame, ASS_Image *img)
@@ -780,6 +794,7 @@ static void render_ass_img(AVFrame *conv_frame, ASS_Image *img)
       }
    }
 }
+#endif
 
 static void decode_thread(void *data)
 {
@@ -860,7 +875,9 @@ static void decode_thread(void *data)
       int subtitle_stream = subtitle_streams[subtitle_streams_ptr];
       AVCodecContext *actx_active = actx[audio_streams_ptr];
       AVCodecContext *sctx_active = sctx[subtitle_streams_ptr];
+#ifdef HAVE_SSA
       ASS_Track *ass_track_active = ass_track[subtitle_streams_ptr];
+#endif
       slock_unlock(decode_thread_lock);
 
       if (pkt.stream_index == video_stream)
@@ -870,6 +887,7 @@ static void decode_thread(void *data)
             int64_t pts = av_frame_get_best_effort_timestamp(vid_frame);
 
             double video_time = pts * av_q2d(fctx->streams[video_stream]->time_base);
+#ifdef HAVE_SSA
             if (ass_render)
             {
                int change = 0;
@@ -880,6 +898,7 @@ static void decode_thread(void *data)
                // We're in a thread anyways, so shouldn't really matter.
                render_ass_img(conv_frame, img);
             }
+#endif
 
             size_t decoded_size = frame_size + sizeof(pts);
             slock_lock(fifo_lock);
@@ -928,11 +947,13 @@ static void decode_thread(void *data)
             }
          }
 
+#ifdef HAVE_SSA
          for (int i = 0; i < sub.num_rects; i++)
          {
             if (sub.rects[i]->ass)
                ass_process_data(ass_track_active, sub.rects[i]->ass, strlen(sub.rects[i]->ass));
          }
+#endif
 
          avsubtitle_free(&sub);
       }
@@ -1165,6 +1186,7 @@ void retro_unload_game(void)
    av_freep(&attachments);
    attachments_size = 0;
 
+#ifdef HAVE_SSA
    for (unsigned i = 0; i < MAX_STREAMS; i++)
    {
       if (ass_track[i])
@@ -1181,6 +1203,7 @@ void retro_unload_game(void)
 
    ass_render = NULL;
    ass = NULL;
+#endif
 
    av_freep(&video_frame_temp_buffer);
 }
