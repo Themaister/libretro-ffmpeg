@@ -25,6 +25,8 @@ PFNGLGENBUFFERSPROC pglGenBuffers;
 PFNGLBUFFERDATAPROC pglBufferData;
 PFNGLBINDBUFFERPROC pglBindBuffer;
 PFNGLMAPBUFFERRANGEPROC pglMapBufferRange;
+PFNGLACTIVETEXTUREPROC pglActiveTexture;
+PFNGLUNMAPBUFFERPROC pglUnmapBuffer;
 
 struct gl_proc_map
 {
@@ -55,6 +57,8 @@ static const struct gl_proc_map proc_map[] = {
    PROC_BIND(BufferData),
    PROC_BIND(BindBuffer),
    PROC_BIND(MapBufferRange),
+   PROC_BIND(ActiveTexture),
+   PROC_BIND(UnmapBuffer),
 };
 
 void glsym_init_procs(retro_hw_get_proc_address_t cb)

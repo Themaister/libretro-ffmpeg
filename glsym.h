@@ -40,6 +40,9 @@
 #define glGenBuffers pglGenBuffers
 #define glBufferData pglBufferData
 #define glBindBuffer pglBindBuffer
+#define glMapBufferRange pglMapBufferRange
+#define glActiveTexture pglActiveTexture
+#define glUnmapBuffer pglUnmapBuffer
 
 extern PFNGLCREATEPROGRAMPROC pglCreateProgram;
 extern PFNGLCREATESHADERPROC pglCreateShader;
@@ -61,6 +64,8 @@ extern PFNGLGENBUFFERSPROC pglGenBuffers;
 extern PFNGLBUFFERDATAPROC pglBufferData;
 extern PFNGLBINDBUFFERPROC pglBindBuffer;
 extern PFNGLMAPBUFFERRANGEPROC pglMapBufferRange;
+extern PFNGLACTIVETEXTUREPROC pglActiveTexture;
+extern PFNGLUNMAPBUFFERPROC pglUnmapBuffer;
 #endif
 
 void glsym_init_procs(retro_hw_get_proc_address_t cb);

@@ -54,14 +54,14 @@ else ifeq ($(platform), win-sw)
    TARGET := $(TARGET_NAME)_sw_retro.dll
    SHARED := -shared -static-libgcc -static-libstdc++ -s -Wl,--version-script=link.T -Wl,--no-undefined
    CFLAGS += -Iffmpeg
-   LIBS += -L. -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample -lass
+   LIBS += -L. -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample
 else
    CC = gcc
    TARGET := $(TARGET_NAME)_retro.dll
    SHARED := -shared -static-libgcc -static-libstdc++ -s -Wl,--version-script=link.T -Wl,--no-undefined
    GL_LIB := -lopengl32
    CFLAGS += -Iffmpeg
-   LIBS += -L. -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample -lass
+   LIBS += -L. -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample
    CFLAGS += -DHAVE_GL
 endif
 
