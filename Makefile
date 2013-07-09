@@ -51,17 +51,17 @@ else ifeq ($(platform), osx-sw)
    CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --cflags) -pthread
 else ifeq ($(platform), win-sw)
    CC = gcc
-   TARGET := $(TARGET_NAME)_sw_retro.dll
+   TARGET := $(TARGET_NAME)_sw_libretro.dll
    SHARED := -shared -static-libgcc -static-libstdc++ -s -Wl,--version-script=link.T -Wl,--no-undefined
    CFLAGS += -Iffmpeg
    LIBS += -L. -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample
 else
    CC = gcc
-   TARGET := $(TARGET_NAME)_retro.dll
+   TARGET := $(TARGET_NAME)_libretro.dll
    SHARED := -shared -static-libgcc -static-libstdc++ -s -Wl,--version-script=link.T -Wl,--no-undefined
    GL_LIB := -lopengl32
    CFLAGS += -Iffmpeg
-   LIBS += -L. -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample
+   LIBS += -L. -Lffmpeg -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample
    CFLAGS += -DHAVE_GL
 endif
 
