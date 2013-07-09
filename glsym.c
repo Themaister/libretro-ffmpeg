@@ -1,5 +1,3 @@
-#ifdef HAVE_GL
-
 #include "glsym.h"
 #include <string.h>
 #include <stdio.h>
@@ -76,7 +74,5 @@ void glsym_init_procs(retro_hw_get_proc_address_t cb)
 {
    (void)cb;
 }
-#endif
-
 #endif
 

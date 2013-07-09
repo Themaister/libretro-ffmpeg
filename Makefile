@@ -22,7 +22,8 @@ ifeq ($(platform), unix)
 
    LIBS = $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --libs) -pthread
    CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --cflags) -pthread
-	CFLAGS += -DHAVE_GL
+   CFLAGS += -DHAVE_GL
+   HAVE_GL := 1
 else ifeq ($(platform), unix-sw)
    TARGET := $(TARGET_NAME)_sw_libretro.so
    fpic := -fPIC
@@ -37,6 +38,7 @@ else ifeq ($(platform), osx)
    SHARED := -dynamiclib
    GL_LIB := -framework OpenGL
    HAVE_SSA := 1
+   HAVE_GL := 1
 
    LIBS = $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --libs) -pthread
    CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --cflags) -pthread
@@ -63,6 +65,7 @@ else
    CFLAGS += -Iffmpeg
    LIBS += -L. -Lffmpeg -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample
    CFLAGS += -DHAVE_GL
+   HAVE_GL := 1
 endif
 
 ifeq ($(HAVE_SSA), 1)
@@ -70,8 +73,7 @@ ifeq ($(HAVE_SSA), 1)
    CFLAGS += -DHAVE_SSA
 endif
 
-SOURCE := $(wildcard *.c)
-OBJECTS := $(SOURCE:.c=.o)
+SOURCE := libretro.c fifo_buffer.c thread.c
 
 CFLAGS += -Wall -std=gnu99 -pedantic $(fpic)
 
@@ -81,12 +83,17 @@ else
    CFLAGS += -O3
 endif
 
-ifeq ($(GLES), 1)
-   LIBS += -lGLESv2
-   CFLAGS += -DGLES
-else
-   LIBS += $(GL_LIB)
+ifeq ($(HAVE_GL), 1)
+   ifeq ($(GLES), 1)
+      LIBS += -lGLESv2
+      CFLAGS += -DGLES
+   else
+      LIBS += $(GL_LIB)
+   endif
+   SOURCE += glsym.c
 endif
+
+OBJECTS := $(SOURCE:.c=.o)
 
 all: $(TARGET)
 
