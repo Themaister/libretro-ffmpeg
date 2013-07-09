@@ -56,7 +56,7 @@ else ifeq ($(platform), win-sw)
    TARGET := $(TARGET_NAME)_sw_libretro.dll
    SHARED := -shared -static-libgcc -static-libstdc++ -s -Wl,--version-script=link.T -Wl,--no-undefined
    CFLAGS += -Iffmpeg
-   LIBS += -L. -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample
+   LIBS += -L. -Lffmpeg -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample
 else
    CC = gcc
    TARGET := $(TARGET_NAME)_libretro.dll
