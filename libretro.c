@@ -982,9 +982,9 @@ static void context_reset(void)
 {
    glsym_init_procs(hw_render.get_proc_address);
 
-   prog = glCreateProgram();
-   GLuint vert = glCreateShader(GL_VERTEX_SHADER);
-   GLuint frag = glCreateShader(GL_FRAGMENT_SHADER);
+   prog = GLSYM(glCreateProgram)();
+   GLuint vert = GLSYM(glCreateShader)(GL_VERTEX_SHADER);
+   GLuint frag = GLSYM(glCreateShader)(GL_FRAGMENT_SHADER);
 
    static const char *vertex_source =
       "attribute vec2 aVertex;\n"
