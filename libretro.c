@@ -799,6 +799,7 @@ static void render_ass_img(AVFrame *conv_frame, ASS_Image *img)
 static void decode_thread(void *data)
 {
    (void)data;
+
    struct SwsContext *sws = NULL;
    
    if (video_stream >= 0)
@@ -809,17 +810,18 @@ static void decode_thread(void *data)
             SWS_POINT, NULL, NULL, NULL);
    }
 
-   SwrContext *swr = swr_alloc();
-
-   if (audio_streams_num > 0)
+   SwrContext *swr[audio_streams_num];
+   for (int i = 0; i < audio_streams_num; i++)
    {
-      av_opt_set_int(swr, "in_channel_layout", actx[0]->channel_layout, 0);
-      av_opt_set_int(swr, "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
-      av_opt_set_int(swr, "in_sample_rate", media.sample_rate, 0);
-      av_opt_set_int(swr, "out_sample_rate", media.sample_rate, 0);
-      av_opt_set_int(swr, "in_sample_fmt", actx[0]->sample_fmt, 0);
-      av_opt_set_int(swr, "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
-      swr_init(swr);
+      swr[i] = swr_alloc();
+
+      av_opt_set_int(swr[i], "in_channel_layout", actx[i]->channel_layout, 0);
+      av_opt_set_int(swr[i], "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
+      av_opt_set_int(swr[i], "in_sample_rate", actx[i]->sample_rate, 0);
+      av_opt_set_int(swr[i], "out_sample_rate", media.sample_rate, 0);
+      av_opt_set_int(swr[i], "in_sample_fmt", actx[i]->sample_fmt, 0);
+      av_opt_set_int(swr[i], "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
+      swr_init(swr[i]);
    }
 
    AVFrame *aud_frame = avcodec_alloc_frame();
@@ -872,6 +874,7 @@ static void decode_thread(void *data)
 
       slock_lock(decode_thread_lock);
       int audio_stream = audio_streams[audio_streams_ptr];
+      int audio_stream_ptr = audio_streams_ptr;
       int subtitle_stream = subtitle_streams[subtitle_streams_ptr];
       AVCodecContext *actx_active = actx[audio_streams_ptr];
       AVCodecContext *sctx_active = sctx[subtitle_streams_ptr];
@@ -930,7 +933,7 @@ static void decode_thread(void *data)
       {
          audio_buffer = decode_audio(actx_active, &pkt, aud_frame,
                audio_buffer, &audio_buffer_cap,
-               swr);
+               swr[audio_stream_ptr]);
       }
       else if (pkt.stream_index == subtitle_stream)
       {
@@ -964,7 +967,10 @@ static void decode_thread(void *data)
    if (sws)
       sws_freeContext(sws);
    sws = NULL;
-   swr_free(&swr);
+
+   for (int i = 0; i < audio_streams_num; i++)
+      swr_free(&swr[i]);
+
    av_freep(&aud_frame);
    av_freep(&vid_frame);
    av_freep(&conv_frame);
