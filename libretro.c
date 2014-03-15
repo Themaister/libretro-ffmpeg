@@ -42,6 +42,8 @@ static AVFormatContext *fctx;
 static AVCodecContext *vctx;
 static int video_stream;
 
+static enum AVColorSpace colorspace;
+
 #define MAX_STREAMS 8
 static AVCodecContext *actx[MAX_STREAMS];
 static AVCodecContext *sctx[MAX_STREAMS];
@@ -200,19 +202,19 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
    };
 }
 
-
 void retro_set_environment(retro_environment_t cb)
 {
    environ_cb = cb;
 
-#ifdef HAVE_GL
    static const struct retro_variable vars[] = {
+#ifdef HAVE_GL
       { "ffmpeg_temporal_interp", "Temporal Interpolation; enabled|disabled" },
+#endif
+      { "ffmpeg_color_space", "Colorspace; auto|BT.709|BT.601|FCC|SMPTE240M" },
       { NULL, NULL },
    };
 
    cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*)vars);
-#endif
 }
 
 void retro_set_audio_sample(retro_audio_sample_t cb)
@@ -258,6 +260,26 @@ static void check_variables(void)
          temporal_interpolation = false;
    }
 #endif
+
+   struct retro_variable color_var = {
+      .key = "ffmpeg_color_space",
+   };
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &color_var) && color_var.value)
+   {
+      slock_lock(decode_thread_lock);
+      if (!strcmp(color_var.value, "BT.709"))
+         colorspace = AVCOL_SPC_BT709;
+      else if (!strcmp(color_var.value, "BT.601"))
+         colorspace = AVCOL_SPC_BT470BG;
+      else if (!strcmp(color_var.value, "FCC"))
+         colorspace = AVCOL_SPC_FCC;
+      else if (!strcmp(color_var.value, "SMPTE240M"))
+         colorspace = AVCOL_SPC_SMPTE240M;
+      else
+         colorspace = AVCOL_SPC_UNSPECIFIED;
+      slock_unlock(decode_thread_lock);
+   }
 }
 
 void retro_run(void)
@@ -655,6 +677,40 @@ static bool init_media_info(void)
    return true;
 }
 
+static void set_colorspace(struct SwsContext *sws,
+      unsigned width, unsigned height, enum AVColorSpace default_color, int in_range)
+{
+   const int *coeffs = NULL;
+   if (colorspace == AVCOL_SPC_UNSPECIFIED)
+   {
+      if (default_color != AVCOL_SPC_UNSPECIFIED)
+         coeffs = sws_getCoefficients(default_color);
+      else if (width >= 1280 || height > 576)
+         coeffs = sws_getCoefficients(AVCOL_SPC_BT709);
+      else
+         coeffs = sws_getCoefficients(AVCOL_SPC_BT470BG);
+   }
+   else
+      coeffs = sws_getCoefficients(colorspace);
+
+   if (coeffs)
+   {
+      int in_full, out_full, brightness, contrast, saturation;
+      const int *inv_table, *table;
+      sws_getColorspaceDetails(sws, (int**)&inv_table, &in_full,
+            (int**)&table, &out_full,
+            &brightness, &contrast, &saturation);
+
+      if (in_range != AVCOL_RANGE_UNSPECIFIED)
+         in_full = in_range == AVCOL_RANGE_JPEG;
+
+      inv_table = coeffs;
+      sws_setColorspaceDetails(sws, inv_table, in_full,
+            table, out_full,
+            brightness, contrast, saturation);
+   }
+}
+
 static bool decode_video(AVPacket *pkt, AVFrame *frame, AVFrame *conv, struct SwsContext *sws)
 {
    int got_ptr = 0;
@@ -664,6 +720,8 @@ static bool decode_video(AVPacket *pkt, AVFrame *frame, AVFrame *conv, struct Sw
 
    if (got_ptr)
    {
+      set_colorspace(sws, media.width, media.height,
+            av_frame_get_colorspace(frame), av_frame_get_color_range(frame));
       sws_scale(sws, (const uint8_t * const*)frame->data, frame->linesize, 0, media.height,
             conv->data, conv->linesize);
       return true;
@@ -1116,12 +1174,13 @@ bool retro_load_game(const struct retro_game_info *info)
    fifo_lock = slock_new();
    decode_thread_lock = slock_new();
 
+   check_variables();
+
    decode_thread_handle = sthread_create(decode_thread, NULL);
 
    video_frame_temp_buffer = av_malloc(media.width * media.height * sizeof(uint32_t));
 
    pts_bias = 0.0;
-   check_variables();
 
    return true;
 
