@@ -658,7 +658,6 @@ static bool init_media_info(void)
 static bool decode_video(AVPacket *pkt, AVFrame *frame, AVFrame *conv, struct SwsContext *sws)
 {
    int got_ptr = 0;
-   avcodec_get_frame_defaults(frame);
    int ret = avcodec_decode_video2(vctx, frame, &got_ptr, pkt);
    if (ret < 0)
       return false;
@@ -683,7 +682,6 @@ static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt, AVFrame *frame,
    for (;;)
    {
       int ret = 0;
-      avcodec_get_frame_defaults(frame);
       ret = avcodec_decode_audio4(ctx, frame, &got_ptr, &pkt_tmp);
       if (ret < 0)
          return buffer;
@@ -832,8 +830,8 @@ static void decode_thread(void *data)
       swr_init(swr[i]);
    }
 
-   AVFrame *aud_frame = avcodec_alloc_frame();
-   AVFrame *vid_frame = avcodec_alloc_frame();
+   AVFrame *aud_frame = av_frame_alloc();
+   AVFrame *vid_frame = av_frame_alloc();
 
    AVFrame *conv_frame = NULL;
    void *conv_frame_buf = NULL;
@@ -842,7 +840,7 @@ static void decode_thread(void *data)
    if (video_stream >= 0)
    {
       frame_size = avpicture_get_size(PIX_FMT_RGB32, media.width, media.height);
-      conv_frame = avcodec_alloc_frame();
+      conv_frame = av_frame_alloc();
       conv_frame_buf = av_malloc(frame_size);
       avpicture_fill((AVPicture*)conv_frame, conv_frame_buf,
             PIX_FMT_RGB32, media.width, media.height);
@@ -979,9 +977,9 @@ static void decode_thread(void *data)
    for (int i = 0; i < audio_streams_num; i++)
       swr_free(&swr[i]);
 
-   av_freep(&aud_frame);
-   av_freep(&vid_frame);
-   av_freep(&conv_frame);
+   av_frame_free(&aud_frame);
+   av_frame_free(&vid_frame);
+   av_frame_free(&conv_frame);
    av_freep(&conv_frame_buf);
    av_freep(&audio_buffer);
 
