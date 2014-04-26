@@ -28,7 +28,7 @@ endif
    CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --cflags) -pthread
 else ifneq (,$(findstring osx,$(platform)))
    TARGET := $(TARGET_NAME)_libretro.dylib
-   fpic := -fPIC -mmacosx-version-min=10.6
+   fpic := -fPIC
    SHARED := -dynamiclib
 ifneq (,$(findstring opengl,$(platform)))
    GL_LIB := -framework OpenGL
@@ -36,6 +36,10 @@ ifneq (,$(findstring opengl,$(platform)))
    CFLAGS += -DHAVE_GL
 endif
    HAVE_SSA := 1
+OSXVER = `sw_vers -productVersion | cut -c 4`
+ifneq ($(OSXVER),9)
+   fpic += -mmacosx-version-min=10.5
+endif
 
    LIBS = $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --libs) -pthread
    CFLAGS += $(shell pkg-config libavcodec libavformat libavutil libavdevice libswscale libswresample libass --cflags) -pthread
