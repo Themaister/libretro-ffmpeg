@@ -1071,10 +1071,10 @@ static void context_reset(void)
       "uniform sampler2D sTex1;\n"
       "uniform float uMix;\n"
 #ifdef GLES
-      "void main() { gl_FragColor = vec4(mix(texture2D(sTex0, vTex).bgr, texture2D(sTex1, vTex).bgr, uMix), 1.0); }\n";
+      "void main() { gl_FragColor = vec4(pow(mix(pow(texture2D(sTex0, vTex).bgr, vec3(2.2)), pow(texture2D(sTex1, vTex).bgr, vec3(2.2)), uMix), vec3(1.0 / 2.2)), 1.0); }\n";
       // Get format as GL_RGBA/GL_UNSIGNED_BYTE. Assume little endian, so we get ARGB -> BGRA byte order, and we have to swizzle to .BGR.
 #else
-      "void main() { gl_FragColor = vec4(mix(texture2D(sTex0, vTex).rgb, texture2D(sTex1, vTex).rgb, uMix), 1.0); }\n";
+      "void main() { gl_FragColor = vec4(pow(mix(pow(texture2D(sTex0, vTex).rgb, vec3(2.2)), pow(texture2D(sTex1, vTex).rgb, vec3(2.2)), uMix), vec3(1.0 / 2.2)), 1.0); }\n";
 #endif
 
    glShaderSource(vert, 1, &vertex_source, NULL);
