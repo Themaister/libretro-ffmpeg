@@ -1,2 +1,12 @@
 *.o
 *.so
+*.a
+/android/includes/libavcodec
+/android/includes/libavutil
+/android/includes/libavformat
+/android/includes/libswscale
+/android/includes/libswresample
+/android/includes/libavdevice
+/android/includes/libpostproc
+/android/includes/libavfilter
+/android/obj
