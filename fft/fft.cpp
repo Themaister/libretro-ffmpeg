@@ -8,10 +8,10 @@
 
 #define GLM_SWIZZLE
 #define GLM_FORCE_RADIANS
-#include <glm/glm.hpp>
-#include <glm/gtc/matrix_transform.hpp>
-#include <glm/gtc/type_ptr.hpp>
-#include <glm/gtc/constants.hpp>
+#include "glm/glm.hpp"
+#include "glm/gtc/matrix_transform.hpp"
+#include "glm/gtc/type_ptr.hpp"
+#include "glm/gtc/constants.hpp"
 using namespace glm;
 
 #define GL_DEBUG 0
@@ -696,7 +696,7 @@ void glfft_free(glfft_t *fft)
    delete fft;
 }
 
-void glfft_step_fft(glfft_t *fft, GLshort *buffer, unsigned frames)
+void glfft_step_fft(glfft_t *fft, const GLshort *buffer, unsigned frames)
 {
    fft->step_fft(buffer, frames);
 }

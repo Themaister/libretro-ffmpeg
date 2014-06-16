@@ -74,7 +74,7 @@ ifeq ($(HAVE_GL_FFT), 1)
    OBJECTS += fft/fft.o
 endif
 
-CFLAGS += -Wall -pedantic $(fpic)
+CFLAGS += -Wall $(fpic)
 
 ifeq ($(DEBUG), 1)
    CFLAGS += -O0 -g
@@ -99,7 +99,7 @@ all: $(TARGET)
 	$(CC) -c -std=gnu99 -o $@ $< $(CFLAGS)
 
 %.o: %.cpp
-	$(CXX) -c -ansi -o $@ $< $(CFLAGS)
+	$(CXX) -c -std=gnu++03 -fno-strict-aliasing -o $@ $< $(CFLAGS)
 
 $(TARGET): $(OBJECTS)
 	$(CXX) -o $@ $^ $(LIBS) $(SHARED)

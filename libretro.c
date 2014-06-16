@@ -77,6 +77,8 @@ static size_t attachments_size;
 
 #ifdef HAVE_GL_FFT
 static glfft_t *fft;
+unsigned fft_width;
+unsigned fft_height;
 #endif
 
 // A/V timing.
@@ -200,6 +202,15 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
    unsigned width  = vctx ? media.width : 320;
    unsigned height = vctx ? media.height : 240;
    float aspect = vctx ? media.aspect : 0.0;
+
+#ifdef HAVE_GL_FFT
+   if (audio_streams_num > 0 && video_stream < 0)
+   {
+      width = fft_width = 1280;
+      height = fft_height = 720;
+      aspect = 16.0 / 9.0;
+   }
+#endif
 
    info->geometry = (struct retro_game_geometry) {
       .base_width   = width,
@@ -550,6 +561,24 @@ void retro_run(void)
       video_cb(dupe ? NULL : video_frame_temp_buffer, media.width, media.height, media.width * sizeof(uint32_t));
 #endif
    }
+#ifdef HAVE_GL_FFT
+   else if (fft)
+   {
+      unsigned frames = to_read_frames;
+      const int16_t *buffer = audio_buffer;
+      while (frames)
+      {
+         unsigned to_read = frames;
+         if (to_read > (1 << 11)) // FFT size we use (1 << 11). Really shouldn't happen unless we use a crazy high sample rate.
+            to_read = 1 << 11;
+         glfft_step_fft(fft, buffer, to_read);
+         buffer += to_read * 2;
+         frames -= to_read;
+      }
+      glfft_render(fft, hw_render.get_current_framebuffer(), fft_width, fft_height);
+      video_cb(RETRO_HW_FRAME_BUFFER_VALID, fft_width, fft_height, fft_width * sizeof(uint32_t));
+   }
+#endif
    else
       video_cb(NULL, 1, 1, sizeof(uint32_t));
 
@@ -572,6 +601,19 @@ static bool open_codec(AVCodecContext **ctx, unsigned index)
       return false;
 
    return true;
+}
+
+static bool codec_is_image(enum AVCodecID id)
+{
+   switch (id)
+   {
+      case CODEC_ID_MJPEG:
+      case CODEC_ID_PNG:
+         return true;
+
+      default:
+         return false;
+   }
 }
 
 static bool open_codecs(void)
@@ -599,7 +641,7 @@ static bool open_codecs(void)
             break;
 
          case AVMEDIA_TYPE_VIDEO:
-            if (!vctx)
+            if (!vctx && !codec_is_image(fctx->streams[i]->codec->codec_id))
             {
                if (!open_codec(&vctx, i))
                   return false;
@@ -1056,9 +1098,26 @@ static void decode_thread(void *data)
 }
 
 #ifdef HAVE_GL
+static void context_destroy(void)
+{
+#ifdef HAVE_GL_FFT
+   if (fft)
+   {
+      glfft_free(fft);
+      fft = NULL;
+   }
+#endif
+}
+
 static void context_reset(void)
 {
-   rglgen_resolve_symbols(hw_render.get_proc_address);
+#ifdef HAVE_GL_FFT
+   if (audio_streams_num > 0 && video_stream < 0)
+      fft = glfft_new(11, hw_render.get_proc_address);
+   // Already inits symbols.
+   if (!fft)
+#endif
+      rglgen_resolve_symbols(hw_render.get_proc_address);
 
    prog = glCreateProgram();
    GLuint vert = glCreateShader(GL_VERTEX_SHADER);
@@ -1159,12 +1218,21 @@ bool retro_load_game(const struct retro_game_info *info)
 
    decode_thread_dead = false;
 
-   if (video_stream >= 0)
+   bool is_glfft = false;
+#ifdef HAVE_GL_FFT
+   is_glfft = video_stream < 0 && audio_streams_num > 0;
+#endif
+
+   if (video_stream >= 0 || is_glfft)
    {
       video_decode_fifo = fifo_new(media.width * media.height * sizeof(uint32_t) * 32);
 
 #ifdef HAVE_GL
       hw_render.context_reset = context_reset;
+      hw_render.context_destroy = context_destroy;
+      hw_render.bottom_left_origin = is_glfft;
+      hw_render.depth = is_glfft;
+      hw_render.stencil = is_glfft;
 #ifdef GLES
       hw_render.context_type = RETRO_HW_CONTEXT_OPENGLES2;
 #else
