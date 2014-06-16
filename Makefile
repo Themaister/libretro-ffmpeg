@@ -61,7 +61,7 @@ ifeq ($(HAVE_SSA), 1)
    CFLAGS += -DHAVE_SSA
 endif
 
-SOURCE := libretro.c fifo_buffer.c thread.c
+OBJECTS = libretro.o fifo_buffer.o thread.o glsym/rglgen.o
 
 CFLAGS += -Wall -std=gnu99 -pedantic $(fpic)
 
@@ -74,14 +74,13 @@ endif
 ifeq ($(HAVE_GL), 1)
    ifeq ($(GLES), 1)
       LIBS += -lGLESv2
-      CFLAGS += -DGLES
+      CFLAGS += -DGLES -DHAVE_OPENGLES2
+      OBJECTS += glsym/glsym_es2.o
    else
       LIBS += $(GL_LIB)
+      OBJECTS += glsym/glsym_gl.o
    endif
-   SOURCE += glsym.c
 endif
-
-OBJECTS := $(SOURCE:.c=.o)
 
 all: $(TARGET)
 
