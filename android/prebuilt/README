@@ -1,0 +1,2 @@
+Build FFmpeg, and move relevant static libraries here.
+libavcodec.a, libavutil.a, libavformat.a, libswscale.a, libswresample.a.

@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <assert.h>
+#include <stdarg.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -27,6 +28,14 @@
 #include "glsym/glsym.h"
 #endif
 
+static void fallback_log(enum retro_log_level level, const char *fmt, ...)
+{
+   va_list va;
+   va_start(va, fmt);
+   vfprintf(stderr, fmt, va);
+   va_end(va);
+}
+
 retro_log_printf_t log_cb;
 static retro_video_refresh_t video_cb;
 static retro_audio_sample_t audio_cb;
@@ -36,8 +45,7 @@ static retro_input_poll_t input_poll_cb;
 static retro_input_state_t input_state_cb;
 
 #define LOG_ERR_GOTO(msg, label) do { \
-   if (log_cb) \
-      log_cb(RETRO_LOG_ERROR, "[FFmpeg]: " msg "\n"); \
+   log_cb(RETRO_LOG_ERROR, "[FFmpeg]: " msg "\n"); \
    goto label; \
 } while(0)
 
@@ -148,7 +156,7 @@ static struct
 static void ass_msg_cb(int level, const char *fmt, va_list args, void *data)
 {
    (void)data;
-   if (level < 6 && log_cb)
+   if (level < 6)
       log_cb(RETRO_LOG_INFO, fmt);
 }
 #endif
@@ -239,6 +247,12 @@ void retro_set_environment(retro_environment_t cb)
    };
 
    cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*)vars);
+
+   struct retro_log_callback log;
+   if (cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log))
+      log_cb = log.log;
+   else
+      log_cb = fallback_log;
 }
 
 void retro_set_audio_sample(retro_audio_sample_t cb)
@@ -440,8 +454,7 @@ void retro_run(void)
 
       if (seek_frames < 0)
       {
-         if (log_cb)
-            log_cb(RETRO_LOG_INFO, "Resetting PTS.\n");
+         log_cb(RETRO_LOG_INFO, "Resetting PTS.\n");
          frames[0].pts = 0.0;
          frames[1].pts = 0.0;
       }
@@ -496,8 +509,7 @@ void retro_run(void)
       pts_bias = reading_pts - expected_pts;
       if (pts_bias < old_pts_bias - 1.0)
       {
-         if (log_cb)
-            log_cb(RETRO_LOG_INFO, "Resetting PTS (bias).\n");
+         log_cb(RETRO_LOG_INFO, "Resetting PTS (bias).\n");
          frames[0].pts = 0.0;
          frames[1].pts = 0.0;
       }
@@ -645,8 +657,7 @@ static bool open_codec(AVCodecContext **ctx, unsigned index)
    AVCodec *codec = avcodec_find_decoder(fctx->streams[index]->codec->codec_id);
    if (!codec)
    {
-      if (log_cb)
-         log_cb(RETRO_LOG_ERROR, "Couldn't find suitable decoder, exiting ... \n");
+      log_cb(RETRO_LOG_ERROR, "Couldn't find suitable decoder, exiting ... \n");
       return false;
    }
 
@@ -876,8 +887,7 @@ static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt, AVFrame *frame,
             scond_wait(fifo_decode_cond, fifo_lock);
          else
          {
-            if (log_cb)
-               log_cb(RETRO_LOG_ERROR, "Thread: Audio deadlock detected ...\n");
+            log_cb(RETRO_LOG_ERROR, "Thread: Audio deadlock detected ...\n");
             fifo_clear(audio_decode_fifo);
             break;
          }
@@ -904,7 +914,7 @@ static void decode_thread_seek(double time)
    decode_last_audio_time = time;
 
    int ret = avformat_seek_file(fctx, -1, INT64_MIN, seek_to, INT64_MAX, 0);
-   if (ret < 0 && log_cb)
+   if (ret < 0)
       log_cb(RETRO_LOG_ERROR, "av_seek_frame() failed.\n");
 
    if (actx[audio_streams_ptr])
@@ -1111,7 +1121,7 @@ static void decode_thread(void *data)
          int finished = 0;
          while (!finished)
          {
-            if (avcodec_decode_subtitle2(sctx_active, &sub, &finished, &pkt) < 0 && log_cb)
+            if (avcodec_decode_subtitle2(sctx_active, &sub, &finished, &pkt) < 0)
             {
                log_cb(RETRO_LOG_ERROR, "Decode subtitles failed.\n");
                break;
