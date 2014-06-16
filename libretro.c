@@ -1301,7 +1301,10 @@ bool retro_load_game(const struct retro_game_info *info)
 #endif
    }
    if (audio_streams_num > 0)
-      audio_decode_fifo = fifo_new(20 * media.sample_rate * sizeof(int16_t) * 2);
+   {
+      unsigned buffer_seconds = video_stream >= 0 ? 20 : 1;
+      audio_decode_fifo = fifo_new(buffer_seconds * media.sample_rate * sizeof(int16_t) * 2);
+   }
 
    fifo_cond = scond_new();
    fifo_decode_cond = scond_new();
