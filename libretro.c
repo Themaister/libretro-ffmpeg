@@ -19,6 +19,10 @@
 #include <ass/ass.h>
 #endif
 
+#ifdef HAVE_GL_FFT
+#include "fft/fft.h"
+#endif
+
 #ifdef HAVE_GL
 #include "glsym/glsym.h"
 #endif
@@ -70,6 +74,10 @@ struct attachment
 };
 static struct attachment *attachments;
 static size_t attachments_size;
+
+#ifdef HAVE_GL_FFT
+static glfft_t *fft;
+#endif
 
 // A/V timing.
 static uint64_t frame_cnt;

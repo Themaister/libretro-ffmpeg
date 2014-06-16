@@ -21,6 +21,7 @@ ifneq (,$(findstring opengl,$(platform)))
    GL_LIB := -lGL
    CFLAGS += -DHAVE_GL
    HAVE_GL := 1
+   HAVE_GL_FFT := 1
 endif
    HAVE_SSA := 1
 
@@ -33,6 +34,7 @@ else ifneq (,$(findstring osx,$(platform)))
 ifneq (,$(findstring opengl,$(platform)))
    GL_LIB := -framework OpenGL
    HAVE_GL := 1
+   HAVE_GL_FFT := 1
    CFLAGS += -DHAVE_GL
 endif
    HAVE_SSA := 1
@@ -52,6 +54,7 @@ ifneq (,$(findstring opengl,$(platform)))
    GL_LIB := -lopengl32
    CFLAGS += -DHAVE_GL
    HAVE_GL := 1
+   HAVE_GL_FFT := 1
 endif
    LIBS += -L. -Lffmpeg -lavcodec -lavformat -lavutil -lavdevice -lswscale -lswresample
 endif
@@ -63,7 +66,15 @@ endif
 
 OBJECTS = libretro.o fifo_buffer.o thread.o glsym/rglgen.o
 
-CFLAGS += -Wall -std=gnu99 -pedantic $(fpic)
+ifeq ($(HAVE_GL_FFT), 1)
+   CFLAGS += -DHAVE_GL_FFT
+   ifeq ($(GLES), 1)
+      CFLAGS += -DHAVE_OPENGLES3
+   endif
+   OBJECTS += fft/fft.o
+endif
+
+CFLAGS += -Wall -pedantic $(fpic)
 
 ifeq ($(DEBUG), 1)
    CFLAGS += -O0 -g
@@ -85,10 +96,13 @@ endif
 all: $(TARGET)
 
 %.o: %.c
-	$(CC) -c -o $@ $< $(CFLAGS)
+	$(CC) -c -std=gnu99 -o $@ $< $(CFLAGS)
+
+%.o: %.cpp
+	$(CXX) -c -ansi -o $@ $< $(CFLAGS)
 
 $(TARGET): $(OBJECTS)
-	$(CC) -o $@ $^ $(LIBS) $(SHARED)
+	$(CXX) -o $@ $^ $(LIBS) $(SHARED)
 
 clean:
 	rm -f $(OBJECTS)
