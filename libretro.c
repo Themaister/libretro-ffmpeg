@@ -79,6 +79,7 @@ static size_t attachments_size;
 static glfft_t *fft;
 unsigned fft_width;
 unsigned fft_height;
+unsigned fft_multisample;
 #endif
 
 // A/V timing.
@@ -206,8 +207,8 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
 #ifdef HAVE_GL_FFT
    if (audio_streams_num > 0 && video_stream < 0)
    {
-      width = fft_width = 1280;
-      height = fft_height = 720;
+      width = fft_width;
+      height = fft_height;
       aspect = 16.0 / 9.0;
    }
 #endif
@@ -228,6 +229,10 @@ void retro_set_environment(retro_environment_t cb)
    static const struct retro_variable vars[] = {
 #ifdef HAVE_GL
       { "ffmpeg_temporal_interp", "Temporal Interpolation; enabled|disabled" },
+#endif
+#ifdef HAVE_GL_FFT
+      { "ffmpeg_fft_resolution", "GLFFT Resolution; 1280x720|1920x1080|640x360|320x180" },
+      { "ffmpeg_fft_multisample", "GLFFT Multisample; 1x|2x|4x" },
 #endif
       { "ffmpeg_color_space", "Colorspace; auto|BT.709|BT.601|FCC|SMPTE240M" },
       { NULL, NULL },
@@ -280,6 +285,32 @@ static void check_variables(void)
    }
 #endif
 
+#ifdef HAVE_GL_FFT
+   struct retro_variable fft_var = {
+      .key = "ffmpeg_fft_resolution",
+   };
+
+   fft_width = 1280;
+   fft_height = 720;
+   fft_multisample = 1;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &fft_var) && fft_var.value)
+   {
+      unsigned w, h;
+      if (sscanf(fft_var.value, "%ux%u", &w, &h) == 2)
+      {
+         fft_width = w;
+         fft_height = h;
+      }
+   }
+
+   struct retro_variable fft_ms_var = {
+      .key = "ffmpeg_fft_multisample",
+   };
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &fft_ms_var) && fft_ms_var.value)
+      fft_multisample = strtoul(fft_ms_var.value, NULL, 0);
+#endif
+
    struct retro_variable color_var = {
       .key = "ffmpeg_color_space",
    };
@@ -304,8 +335,31 @@ static void check_variables(void)
 void retro_run(void)
 {
    bool updated = false;
+
+#ifdef HAVE_GL_FFT
+   unsigned old_fft_width = fft_width;
+   unsigned old_fft_height = fft_height;
+   unsigned old_fft_multisample = fft_multisample;
+#endif
+
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       check_variables();
+
+#ifdef HAVE_GL_FFT
+   if (fft_width != old_fft_width || fft_height != old_fft_height)
+   {
+      struct retro_system_av_info info;
+      retro_get_system_av_info(&info);
+      if (!environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info))
+      {
+         fft_width = old_fft_width;
+         fft_height = old_fft_height;
+      }
+   }
+
+   if (fft && (old_fft_multisample != fft_multisample))
+      glfft_init_multisample(fft, fft_width, fft_height, fft_multisample);
+#endif
 
    input_poll_cb();
 
@@ -1113,7 +1167,11 @@ static void context_reset(void)
 {
 #ifdef HAVE_GL_FFT
    if (audio_streams_num > 0 && video_stream < 0)
+   {
       fft = glfft_new(11, hw_render.get_proc_address);
+      if (fft)
+         glfft_init_multisample(fft, fft_width, fft_height, fft_multisample);
+   }
    // Already inits symbols.
    if (!fft)
 #endif

@@ -13,6 +13,7 @@ struct GLFFT
       GLFFT();
       void context_reset(unsigned fft_steps, rglgen_proc_address_t proc, unsigned fft_depth = 256);
       void context_destroy();
+      void init_multisample(unsigned width, unsigned height, unsigned samples);
 
       void step_fft(const GLshort *buffer, unsigned frames);
       void render(GLuint backbuffer, unsigned width, unsigned height);
@@ -25,6 +26,7 @@ struct GLFFT
             operator GLuint& () { return id; }
             GLResource& operator=(GLuint id) { this->id = id; return *this; }
             GLuint* addr() { return &id; }
+            operator bool() const { return id != 0; }
          private:
             GLuint id;
       };
@@ -40,6 +42,10 @@ struct GLFFT
          Target target;
          GLResource parameter_tex;
       };
+
+      GLResource ms_rb_color;
+      GLResource ms_rb_ds;
+      GLResource ms_fbo;
 
       std::vector<Pass> passes;
       GLResource input_tex;

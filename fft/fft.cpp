@@ -276,7 +276,7 @@ GLuint GLFFT::compile_program(const char *vertex_source, const char *fragment_so
 void GLFFT::render(GLuint backbuffer, unsigned width, unsigned height)
 {
    // Render scene.
-   glBindFramebuffer(GL_FRAMEBUFFER, backbuffer);
+   glBindFramebuffer(GL_FRAMEBUFFER, ms_fbo ? ms_fbo : backbuffer);
    glViewport(0, 0, width, height);
    glClearColor(0.1f, 0.15f, 0.1f, 1.0f);
    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -296,6 +296,21 @@ void GLFFT::render(GLuint backbuffer, unsigned width, unsigned height)
    glDrawElements(GL_TRIANGLE_STRIP, block.elems, GL_UNSIGNED_INT, NULL);
    glBindVertexArray(0);
    glUseProgram(0);
+
+   if (ms_fbo)
+   {
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, ms_fbo);
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, backbuffer);
+      glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+      static const GLenum attachments[] = { GL_COLOR_ATTACHMENT0, GL_DEPTH_STENCIL_ATTACHMENT };
+      glBindFramebuffer(GL_FRAMEBUFFER, ms_fbo);
+      glInvalidateFramebuffer(GL_FRAMEBUFFER, 2, attachments);
+      GL_CHECK_ERROR();
+   }
+
+   glBindFramebuffer(GL_FRAMEBUFFER, 0);
+   GL_CHECK_ERROR();
 }
 
 void GLFFT::step_fft(const GLshort *audio_buffer, unsigned frames)
@@ -658,8 +673,43 @@ void GLFFT::context_reset(unsigned fft_steps, rglgen_proc_address_t proc, unsign
    GL_CHECK_ERROR();
 }
 
+void GLFFT::init_multisample(unsigned width, unsigned height, unsigned samples)
+{
+   if (ms_rb_color)
+      glDeleteRenderbuffers(1, ms_rb_color.addr());
+   if (ms_rb_ds)
+      glDeleteRenderbuffers(1, ms_rb_ds.addr());
+   if (ms_fbo)
+      glDeleteFramebuffers(1, ms_fbo.addr());
+   ms_rb_color = 0;
+   ms_rb_ds = 0;
+   ms_fbo = 0;
+
+   if (samples > 1)
+   {
+      glGenRenderbuffers(1, ms_rb_color.addr());
+      glGenRenderbuffers(1, ms_rb_ds.addr());
+      glGenFramebuffers(1, ms_fbo.addr());
+
+      glBindRenderbuffer(GL_RENDERBUFFER, ms_rb_color);
+      glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, width, height);
+      glBindRenderbuffer(GL_RENDERBUFFER, ms_rb_ds);
+      glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH24_STENCIL8, width, height);
+      glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+      glBindFramebuffer(GL_FRAMEBUFFER, ms_fbo);
+      glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, ms_rb_color);
+      glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, ms_rb_ds);
+      if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+         init_multisample(0, 0, 0);
+   }
+
+   glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
 void GLFFT::context_destroy()
 {
+   init_multisample(0, 0, 0);
    passes.clear();
    sliding.clear();
 }
@@ -704,5 +754,10 @@ void glfft_step_fft(glfft_t *fft, const GLshort *buffer, unsigned frames)
 void glfft_render(glfft_t *fft, GLuint backbuffer, unsigned width, unsigned height)
 {
    fft->render(backbuffer, width, height);
+}
+
+void glfft_init_multisample(glfft_t *fft, unsigned width, unsigned height, unsigned samples)
+{
+   fft->init_multisample(width, height, samples);
 }
 
